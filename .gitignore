@@ -1,0 +1,22 @@
+*.js
+!jest.config.js
+*.d.ts
+node_modules
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+
+# Test data
+testdata/
+
+# macOS
+.DS_Store
+
+# Environment files
+.env
+.env.*
+# Python
+__pycache__/
+*.py[cod]
+*$py.class

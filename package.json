@@ -1,0 +1,26 @@
+{
+  "name": "sample-text2sql-agent",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "cdk": "bin/cdk.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "cdk": "cdk"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "aws-cdk": "^2.1116.0",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.9.3"
+  },
+  "dependencies": {
+    "@aws-cdk/aws-bedrock-agentcore-alpha": "^2.248.0-alpha.0",
+    "@aws-cdk/aws-lambda-python-alpha": "^2.248.0-alpha.0",
+    "aws-cdk-lib": "^2.240.0",
+    "constructs": "^10.0.0",
+    "deploy-time-build": "^0.4.8"
+  }
+}
