@@ -1,6 +1,11 @@
 import * as path from 'node:path';
-import { RemovalPolicy } from 'aws-cdk-lib';
-import { Distribution, GeoRestriction, ViewerProtocolPolicy } from 'aws-cdk-lib/aws-cloudfront';
+import { RemovalPolicy, Duration } from 'aws-cdk-lib';
+import {
+  Distribution, GeoRestriction, ViewerProtocolPolicy,
+  CachePolicy, CacheHeaderBehavior, CacheCookieBehavior, CacheQueryStringBehavior,
+  OriginRequestPolicy, OriginRequestHeaderBehavior,
+  OriginRequestCookieBehavior, OriginRequestQueryStringBehavior,
+} from 'aws-cdk-lib/aws-cloudfront';
 import { S3BucketOrigin } from 'aws-cdk-lib/aws-cloudfront-origins';
 import { Bucket, BlockPublicAccess } from 'aws-cdk-lib/aws-s3';
 import { NodejsBuild } from 'deploy-time-build';
@@ -34,6 +39,25 @@ export class Frontend extends Construct {
       defaultBehavior: {
         viewerProtocolPolicy: ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         origin: S3BucketOrigin.withOriginAccessControl(webBucket),
+        // ビューワーの Cache-Control: no-cache をキャッシュキーに含めないポリシー。
+        // これにより CloudFront はキャッシュヒット時にオリジンへ転送しない。
+        cachePolicy: new CachePolicy(this, 'StaticCachePolicy', {
+          defaultTtl: Duration.days(1),
+          maxTtl: Duration.days(365),
+          minTtl: Duration.seconds(0),
+          headerBehavior: CacheHeaderBehavior.none(),
+          cookieBehavior: CacheCookieBehavior.none(),
+          queryStringBehavior: CacheQueryStringBehavior.none(),
+          enableAcceptEncodingGzip: true,
+          enableAcceptEncodingBrotli: true,
+        }),
+        // S3 へのリクエストから全ヘッダーを除外するポリシー。
+        // Cache-Control / Pragma が OAC 署名に混入して S3 が 403 を返すのを防ぐ。
+        originRequestPolicy: new OriginRequestPolicy(this, 'S3OriginRequestPolicy', {
+          headerBehavior: OriginRequestHeaderBehavior.none(),
+          cookieBehavior: OriginRequestCookieBehavior.none(),
+          queryStringBehavior: OriginRequestQueryStringBehavior.none(),
+        }),
       },
       errorResponses: [
         { httpStatus: 403, responseHttpStatus: 200, responsePagePath: '/index.html' },

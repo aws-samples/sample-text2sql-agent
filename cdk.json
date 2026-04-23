@@ -93,6 +93,7 @@
     "@aws-cdk/aws-route53-patterns:useDistribution": true,
     "allowOrigin": "*",
     "allowedCidrs": ["0.0.0.0/1", "128.0.0.0/1"],
+    "allowedIpv6Cidrs": ["::/1", "8000::/1"],
     "bedrockModelId": "global.anthropic.claude-sonnet-4-6",
     "csvInputBucketName": "",
     "sqlResultThreshold": 200,
