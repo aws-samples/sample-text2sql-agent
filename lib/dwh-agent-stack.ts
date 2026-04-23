@@ -11,6 +11,7 @@ import { RegionalWaf } from './regional-waf';
 export interface DwhAgentStackProps extends cdk.StackProps {
   allowOrigin: string;
   allowedCidrs: string[];
+  allowedIpv6Cidrs?: string[];
   webAclArn: string;
   bedrockModelId: string;
   /** 既存 CSV バケット名 (未指定時は新規作成) */
@@ -51,6 +52,7 @@ export class DwhAgentStack extends cdk.Stack {
 
     const regionalWaf = new RegionalWaf(this, 'RegionalWaf', {
       allowedCidrs: props.allowedCidrs,
+      allowedIpv6Cidrs: props.allowedIpv6Cidrs,
     });
 
     // ========================================

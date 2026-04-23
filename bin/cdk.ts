@@ -7,6 +7,7 @@ const app = new cdk.App();
 
 const allowOrigin = app.node.tryGetContext('allowOrigin');
 const allowedCidrs = app.node.tryGetContext('allowedCidrs');
+const allowedIpv6Cidrs: string[] = app.node.tryGetContext('allowedIpv6Cidrs') ?? [];
 const bedrockModelId = app.node.tryGetContext('bedrockModelId');
 const csvInputBucketName = app.node.tryGetContext('csvInputBucketName');
 const sqlResultThreshold = app.node.tryGetContext('sqlResultThreshold') ?? 200;
@@ -22,6 +23,7 @@ const wafStack = new WafStack(app, stackPrefix + 'DwhAgentWafStack', {
     account: process.env.CDK_DEFAULT_ACCOUNT,
   },
   allowedCidrs,
+  allowedIpv6Cidrs,
   crossRegionReferences: true,
 });
 
@@ -32,6 +34,7 @@ new DwhAgentStack(app, stackPrefix + 'DwhAgentStack', {
   },
   allowOrigin,
   allowedCidrs,
+  allowedIpv6Cidrs,
   webAclArn: wafStack.webAclArn,
   bedrockModelId,
   csvInputBucketName,
