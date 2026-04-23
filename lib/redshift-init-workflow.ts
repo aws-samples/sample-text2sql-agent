@@ -52,6 +52,7 @@ export class RedshiftInitWorkflow extends Construct {
     const startBuildFn = new PythonFunction(this, 'StartBuildFn', {
       entry,
       runtime: lambda.Runtime.PYTHON_3_14,
+      architecture: lambda.Architecture.ARM_64,
       index: 'handlers.py',
       handler: 'handle_start_build',
       timeout: cdk.Duration.minutes(15),
@@ -64,6 +65,7 @@ export class RedshiftInitWorkflow extends Construct {
     const checkAndFinalizeFn = new PythonFunction(this, 'CheckAndFinalizeFn', {
       entry,
       runtime: lambda.Runtime.PYTHON_3_14,
+      architecture: lambda.Architecture.ARM_64,
       index: 'handlers.py',
       handler: 'handle_check_and_finalize',
       timeout: cdk.Duration.minutes(5),

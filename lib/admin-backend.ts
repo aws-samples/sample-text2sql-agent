@@ -49,9 +49,9 @@ export class AdminBackend extends Construct {
     this.handler = new lambda.DockerImageFunction(this, 'Handler', {
       code: lambda.DockerImageCode.fromImageAsset(
         path.join(__dirname, '../lambda/adminwebbackend'),
-        { platform: cdk.aws_ecr_assets.Platform.LINUX_AMD64 },
+        { platform: cdk.aws_ecr_assets.Platform.LINUX_ARM64 },
       ),
-      architecture: lambda.Architecture.X86_64,
+      architecture: lambda.Architecture.ARM_64,
       timeout: cdk.Duration.minutes(15),
       memorySize: 2048,
       tracing: lambda.Tracing.ACTIVE,
