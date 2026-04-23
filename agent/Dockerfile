@@ -1,5 +1,5 @@
 # Single-stage Dockerfile for ARM64 AgentCore Runtime deployment
-FROM --platform=linux/arm64 python:3.13-slim
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.13-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
