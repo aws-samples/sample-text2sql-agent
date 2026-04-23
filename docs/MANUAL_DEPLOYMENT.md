@@ -26,8 +26,8 @@ npm ci
 | `sqlResultThreshold` | Agent SQL 結果の行数上限 | `200` |
 | `enablePromptCache` | Bedrock Prompt Cache の有効/無効 | `true` |
 | `stackPrefix` | スタック名のプレフィックス。同一 AWS アカウントに複数環境をデプロイする場合に指定 (例: `Dev`, `Stg`, `TeamA`, `TeamB`) | `""` (空文字) |
-| `testAgentUser` | Agent UserPool に自動作成するテストユーザー名。空文字の場合は作成しない。パスワードは CDK が自動生成して Secrets Manager に保管する | `""` (空文字) |
-| `testAdminUser` | Admin UserPool に自動作成するテストユーザー名。空文字の場合は作成しない。パスワードは CDK が自動生成して Secrets Manager に保管する | `""` (空文字) |
+| `testAgentUser` | Agent UserPool に自動作成するテストユーザー名。空文字の場合は作成しない。メールアドレスではなくユーザー名とすること。パスワードは CDK が自動生成して Secrets Manager に保管する | `""` (空文字) |
+| `testAdminUser` | Admin UserPool に自動作成するテストユーザー名。空文字の場合は作成しない。メールアドレスではなくユーザー名とすること。パスワードは CDK が自動生成して Secrets Manager に保管する | `""` (空文字) |
 
 アクセス元IPアドレスを縛るには `allowedCidrs` を実際の IP 範囲に制限してください。
 

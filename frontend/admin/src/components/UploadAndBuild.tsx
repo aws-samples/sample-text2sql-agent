@@ -83,19 +83,20 @@ export default function UploadAndBuild() {
 
   // ---- Mode B: Existing S3 prefix ----
   const handleListCsv = async () => {
-    if (!s3Prefix.trim()) return;
     setLoading(true);
     setLoadingMessage('ファイル一覧を取得中...');
     setError(null);
     setListedFiles(null);
     try {
-      const { prefix: p, files: csvFiles } = await api.listCsv(s3Prefix.trim());
+      const inputPrefix = s3Prefix.trim();
+      const { files: csvFiles } = await api.listCsv(inputPrefix);
       if (csvFiles.length === 0) {
         setError('指定された prefix 配下に CSV ファイルが見つかりません');
         return;
       }
       setListedFiles(csvFiles);
-      setPrefix(p);
+      // ユーザー入力をそのまま保持（バックエンドの正規化結果は捨てる）
+      setPrefix(inputPrefix);
       setActiveStep(1);
     } catch (e: any) {
       setError(e.message);
@@ -107,7 +108,7 @@ export default function UploadAndBuild() {
 
   // ---- Step 2: Analyze ----
   const handleAnalyze = async () => {
-    if (!prefix) return;
+    if (prefix === null) return;
     setLoading(true);
     setLoadingMessage('CSV を AI 分析中です。しばらくお待ちください...');
     setError(null);
@@ -142,7 +143,7 @@ export default function UploadAndBuild() {
 
   // ---- Step 4: Apply (async with polling) ----
   const handleApply = useCallback(async () => {
-    if (applyingRef.current || !prefix) return;
+    if (applyingRef.current || prefix === null) return;
     applyingRef.current = true;
     setLoading(true);
     setLoadingMessage('データベース構築とデータロード中...');
@@ -187,7 +188,7 @@ export default function UploadAndBuild() {
   }, [prefix, editSystemPrompt, editDbSchema, editAgentName]);
 
   // ---- Step summaries for completed steps ----
-  const step1Summary = prefix
+  const step1Summary = prefix !== null
     ? mode === 'upload'
       ? `${files.length} ファイルアップロード済み (${prefix})`
       : `S3: ${prefix} (${listedFiles?.length ?? 0} ファイル)`
