@@ -1,5 +1,6 @@
 import * as cdk from 'aws-cdk-lib';
 import * as redshiftserverless from 'aws-cdk-lib/aws-redshiftserverless';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
@@ -12,12 +13,17 @@ export interface RedshiftServerlessProps {
 
 
 /**
- * Redshift Serverless (Public, Data API 経由接続)
+ * Redshift Serverless (Data API 経由接続)
  * L2 construct が存在しないため L1 (CfnNamespace, CfnWorkgroup) を使用
+ *
+ * デフォルト VPC に依存しないよう、専用 VPC / SecurityGroup / Subnet を
+ * 明示的に作成して Workgroup に紐付ける (issue #4)。
  */
 export class RedshiftServerless extends Construct {
   readonly namespace: redshiftserverless.CfnNamespace;
   readonly workgroup: redshiftserverless.CfnWorkgroup;
+  readonly vpc: ec2.Vpc;
+  readonly securityGroup: ec2.SecurityGroup;
   readonly adminSecret: secretsmanager.Secret;
   readonly agentSecret: secretsmanager.Secret;
   readonly workgroupName: string;
@@ -30,6 +36,27 @@ export class RedshiftServerless extends Construct {
     const prefix = cdk.Stack.of(this).stackName.toLowerCase();
     this.namespaceName = `${prefix}-dwh-agent-ns`;
     this.workgroupName = `${prefix}-dwh-agent-wg`;
+
+    this.vpc = new ec2.Vpc(this, 'Vpc', {
+      maxAzs: 3,
+      natGateways: 0,
+      subnetConfiguration: [
+        {
+          name: 'Isolated',
+          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+          cidrMask: 24,
+        },
+      ],
+    });
+
+    // Workgroup 用 SecurityGroup。
+    // Data API / COPY ともに VPC 内通信を伴わないため実際のトラフィックは発生しないが、
+    // Workgroup にアタッチしてデフォルト VPC の default SG への暗黙依存を避けるために作成する。
+    this.securityGroup = new ec2.SecurityGroup(this, 'WorkgroupSecurityGroup', {
+      vpc: this.vpc,
+      description: 'Redshift Serverless Workgroup SG (no traffic expected; Data API / COPY use AWS internal network)',
+      allowAllOutbound: true,
+    });
 
     // Admin credentials (SUPERUSER)
     this.adminSecret = new secretsmanager.Secret(this, 'AdminSecret', {
@@ -72,6 +99,8 @@ export class RedshiftServerless extends Construct {
       namespaceName: this.namespaceName,
       publiclyAccessible: false,
       baseCapacity: 8, // 最小 RPU
+      subnetIds: this.vpc.isolatedSubnets.map((s) => s.subnetId),
+      securityGroupIds: [this.securityGroup.securityGroupId],
     });
     this.workgroup.addDependency(this.namespace);
   }
