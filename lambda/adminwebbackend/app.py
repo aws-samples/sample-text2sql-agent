@@ -1,3 +1,4 @@
+import codecs
 import csv
 import io
 import json
@@ -236,8 +237,11 @@ def _detect_encoding(bucket: str, key: str) -> None:
     """S3 の CSV ファイル先頭を読み取って UTF-8 であることを検証。UTF-8 以外はエラー。"""
     resp = s3.get_object(Bucket=bucket, Key=key, Range="bytes=0-8192")
     raw = resp["Body"].read()
+    # Range GET の末尾がマルチバイト文字の途中で切れる可能性があるため、
+    # incremental decoder を使って「末尾の不完全バイト列」を許容する。
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
     try:
-        raw.decode("utf-8")
+        decoder.decode(raw, final=False)
     except UnicodeDecodeError:
         raise ValueError(f"UTF-8 以外のエンコーディングが検出されました: {key}。CSV は UTF-8 で保存してください。")
 
