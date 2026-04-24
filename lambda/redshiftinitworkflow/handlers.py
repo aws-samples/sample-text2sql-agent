@@ -29,8 +29,31 @@ CONFIG_TABLE_NAME = os.environ["CONFIG_TABLE_NAME"]
 
 redshift_data = boto3.client("redshift-data")
 secrets_client = boto3.client("secretsmanager")
+s3_client = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 config_table = dynamodb.Table(CONFIG_TABLE_NAME)
+
+# CSV バケットの実リージョン（クロスリージョン COPY 対応のため Lambda のリージョンではなく
+# バケット自身のリージョンを COPY 文の REGION 句に埋め込む）。
+def _resolve_bucket_region(bucket_name: str) -> str:
+    try:
+        resp = s3_client.head_bucket(Bucket=bucket_name)
+        # 1. SDK がパースする BucketRegion フィールド（新しめの boto3）
+        region = resp.get("BucketRegion")
+        if region:
+            return region
+        # 2. フォールバック: x-amz-bucket-region レスポンスヘッダー
+        headers = resp.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+        region = headers.get("x-amz-bucket-region")
+        if region:
+            return region
+    except Exception as e:
+        logger.warning("head_bucket failed for %s: %s — fallback to Lambda region", bucket_name, e)
+    return boto3.session.Session().region_name
+
+
+CSV_BUCKET_REGION = _resolve_bucket_region(CSV_BUCKET_NAME)
+logger.info("CSV bucket region resolved: bucket=%s region=%s", CSV_BUCKET_NAME, CSV_BUCKET_REGION)
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +190,7 @@ def _generate_copy(table: dict) -> list[str]:
             f"IAM_ROLE '{REDSHIFT_ADMIN_ROLE_ARN}' "
             f"CSV DELIMITER '{delimiter}' "
             f"IGNOREHEADER 1 "
-            f"REGION '{boto3.session.Session().region_name}'"
+            f"REGION '{CSV_BUCKET_REGION}'"
             f" ENCODING UTF8"
         )
 

@@ -79,6 +79,14 @@ export class RedshiftInitWorkflow extends Construct {
     props.redshift.grantDataApi(sharedRole, props.redshift.adminSecret);
     props.redshift.agentSecret.grantRead(sharedRole);
 
+    // CSV バケットのリージョンを解決するため HeadBucket を許可
+    // (クロスリージョン COPY 対応: Lambda のリージョンではなくバケットの実リージョンを使うため)
+    // 注: HeadBucket API に必要な IAM アクションは s3:ListBucket
+    sharedRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      actions: ['s3:ListBucket'],
+      resources: [props.csvBucket.bucketArn],
+    }));
+
     // Step Functions 定義
     const startBuildTask = new tasks.LambdaInvoke(this, 'StartBuild', {
       lambdaFunction: startBuildFn,
