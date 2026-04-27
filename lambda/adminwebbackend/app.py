@@ -213,18 +213,24 @@ async def list_csv(request: Request, body: ListCsvRequest):
     prefix = body.prefix.lstrip("/")
     logger.info("POST /admin/list-csv: prefix=%s", prefix)
 
-    paginator = s3.get_paginator("list_objects_v2")
-    files: list[str] = []
-    for page in paginator.paginate(Bucket=CSV_BUCKET_NAME, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key: str = obj["Key"]
-            if key.lower().endswith(".csv"):
-                # ファイル名のみ（prefix 除去）
-                filename = key[len(prefix):]
-                if filename and "/" not in filename:
-                    files.append(filename)
+    # analyze と同じルート（再帰列挙 + 末尾 / 正規化）で CSV と manifest を列挙する
+    csv_keys = _list_csv_files(prefix)
+    manifest_keys = _list_manifest_files(prefix)
 
-    return JSONResponse(content={"prefix": prefix, "files": files})
+    normalized = _normalize_prefix(prefix)
+
+    # 画面表示用にキー先頭のプレフィックスを除去し、相対パスにする
+    def _to_relative(key: str) -> str:
+        return key[len(normalized):] if normalized and key.startswith(normalized) else key
+
+    files = [_to_relative(k) for k in csv_keys]
+    manifests = [_to_relative(k) for k in manifest_keys]
+
+    return JSONResponse(content={
+        "prefix": prefix,
+        "files": files,
+        "manifests": manifests,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -374,18 +380,126 @@ def _analyze_csv_file(bucket: str, key: str) -> dict:
         return {"error": f"CSV分析エラー: {str(e)}", "key": key}
 
 
+def _normalize_prefix(prefix: str) -> str:
+    """S3 prefix を列挙用に正規化する（末尾に `/` を強制）。
+
+    list_objects_v2 は Prefix に完全一致の文字列前方一致を行うため、末尾に `/` を
+    付けないと例えば `sales` 指定時に `sales_2024/...` まで巻き込んでしまう。
+    空プレフィックス（バケット全体）の指定は許容する。
+    """
+    if not prefix:
+        return ""
+    return prefix if prefix.endswith("/") else prefix + "/"
+
+
 def _list_csv_files(prefix: str) -> list[str]:
-    """S3 prefix 配下の .csv ファイルキーを列挙"""
+    """S3 prefix 配下を再帰的に列挙し、.csv ファイルキーを返す。
+
+    サブディレクトリ配下も含めて返す。例: prefix/sub/a.csv も検知される。
+    """
     paginator = s3.get_paginator("list_objects_v2")
     keys: list[str] = []
-    for page in paginator.paginate(Bucket=CSV_BUCKET_NAME, Prefix=prefix):
+    normalized = _normalize_prefix(prefix)
+    for page in paginator.paginate(Bucket=CSV_BUCKET_NAME, Prefix=normalized):
         for obj in page.get("Contents", []):
             key: str = obj["Key"]
             if key.lower().endswith(".csv"):
-                filename = key[len(prefix):]
-                if filename and "/" not in filename:
-                    keys.append(key)
+                keys.append(key)
     return keys
+
+
+def _list_manifest_files(prefix: str) -> list[str]:
+    """S3 prefix 配下を再帰的に列挙し、.manifest ファイルキーを返す。"""
+    paginator = s3.get_paginator("list_objects_v2")
+    keys: list[str] = []
+    normalized = _normalize_prefix(prefix)
+    for page in paginator.paginate(Bucket=CSV_BUCKET_NAME, Prefix=normalized):
+        for obj in page.get("Contents", []):
+            key: str = obj["Key"]
+            if key.lower().endswith(".manifest"):
+                keys.append(key)
+    return keys
+
+
+class ManifestValidationError(Exception):
+    """manifest 検証エラー（entries に壊れた参照がある場合）"""
+
+
+def _read_manifest_entries(
+    bucket: str,
+    key: str,
+    allowed_keys: set[str],
+    normalized_prefix: str,
+) -> list[str]:
+    """Redshift COPY MANIFEST を読み、entries の url から s3 キーのリストを返す。
+
+    manifest 形式: {"entries": [{"url": "s3://bucket/key", "mandatory": true}, ...]}
+
+    厳格検証（いずれかに該当したら ManifestValidationError を投げる）:
+      1. `s3://<bucket>/` 以外で始まる url（別バケット参照 / 相対パス）
+      2. 指定 prefix 配下でない key（列挙範囲外）
+      3. prefix 配下だが `list_objects_v2` で列挙されなかった key（実在しない）
+
+    url はパーセントエンコーディング（%20 等）を unquote して照合する。
+    """
+    from urllib.parse import unquote
+
+    resp = s3.get_object(Bucket=bucket, Key=key)
+    raw = resp["Body"].read()
+    data = json.loads(raw)
+    bucket_prefix = f"s3://{bucket}/"
+
+    out: list[str] = []
+    invalid_bucket: list[str] = []
+    out_of_prefix: list[str] = []
+    missing_keys: list[str] = []
+
+    for entry in data.get("entries", []):
+        url = entry.get("url", "")
+        if not url.startswith(bucket_prefix):
+            invalid_bucket.append(url)
+            continue
+        entry_key = unquote(url[len(bucket_prefix):])
+        if normalized_prefix and not entry_key.startswith(normalized_prefix):
+            out_of_prefix.append(entry_key)
+            continue
+        if entry_key not in allowed_keys:
+            missing_keys.append(entry_key)
+            continue
+        out.append(entry_key)
+
+    errors: list[str] = []
+    if invalid_bucket:
+        errors.append(
+            f"CSV バケット外または不正な URL を参照しています ({len(invalid_bucket)} 件): "
+            + ", ".join(invalid_bucket[:5])
+            + (" ..." if len(invalid_bucket) > 5 else "")
+        )
+    if out_of_prefix:
+        errors.append(
+            f"指定 prefix '{normalized_prefix}' の外を参照しています ({len(out_of_prefix)} 件): "
+            + ", ".join(out_of_prefix[:5])
+            + (" ..." if len(out_of_prefix) > 5 else "")
+        )
+    if missing_keys:
+        errors.append(
+            f"実在しない CSV を参照しています ({len(missing_keys)} 件): "
+            + ", ".join(missing_keys[:5])
+            + (" ..." if len(missing_keys) > 5 else "")
+        )
+    if errors:
+        raise ManifestValidationError(
+            f"manifest '{key}' の検証に失敗しました: " + " / ".join(errors)
+        )
+
+    return out
+
+
+def _basename_without_ext(key: str) -> str:
+    """S3 キーから拡張子なしの basename を取り出す（テーブル名ヒント用）"""
+    filename = key.rsplit("/", 1)[-1]
+    dot = filename.rfind(".")
+    return filename[:dot] if dot > 0 else filename
 
 
 TABLE_ANALYZE_SYSTEM_PROMPT = """あなたはデータベース設計の専門家です。
@@ -462,9 +576,11 @@ _TABLE_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
-def _analyze_single_csv_with_bedrock(info: dict, group_keys: list[str]) -> dict:
+def _analyze_single_csv_with_bedrock(info: dict, group_keys: list[str], table_name_hint: str | None = None) -> dict:
     """1 つの CSV 分析結果を Bedrock に送り、テーブル定義を取得する。
-    group_keys にはグループ内の全 S3 キーを渡す。"""
+    group_keys にはグループ内の全 S3 キーを渡す。
+    table_name_hint を渡すと、Bedrock に対してテーブル名の命名ヒントとして提示する
+    （manifest ベースのグループで manifest の basename をテーブル名に使いたい場合）。"""
 
     user_message = f"""以下の CSV ファイルを分析してテーブル定義を生成してください。
 
@@ -492,6 +608,14 @@ def _analyze_single_csv_with_bedrock(info: dict, group_keys: list[str]) -> dict:
     if len(group_keys) > 1:
         filenames = "\n".join(f"  - {k.rsplit('/', 1)[-1]}" for k in group_keys)
         user_message += f"\n\nこのテーブルには以下の {len(group_keys)} ファイルがグルーピングされています:\n{filenames}\nファイル名の共通部分からテーブル名を推定してください。"
+
+    # manifest ベースのグループでは basename をテーブル名のヒントとして強く提示する
+    if table_name_hint:
+        user_message += (
+            f"\n\nこのテーブルは manifest '{table_name_hint}.manifest' で定義されています。"
+            f"テーブル名は原則 '{table_name_hint}' を採用してください"
+            f"（非アルファベットの場合は意味を英訳してスネークケースに変換して構いません）。"
+        )
 
     tool_config = {
         "tools": [
@@ -645,9 +769,48 @@ async def analyze(request: Request, body: AnalyzeRequest):
     prefix = body.prefix.lstrip("/")
     logger.info("POST /admin/analyze: prefix=%s", prefix)
 
-    csv_keys = _list_csv_files(prefix)
-    if not csv_keys:
-        raise HTTPException(status_code=400, detail="指定された prefix 配下に CSV ファイルが見つかりません")
+    # CSV と manifest を並行して列挙（サブディレクトリ含む再帰列挙）
+    all_csv_keys = _list_csv_files(prefix)
+    manifest_keys = _list_manifest_files(prefix)
+
+    # manifest の entries を厳格検証しつつ解決
+    # （entries が CSV バケット外 / prefix 外 / 実在しない場合は即エラー）
+    normalized_prefix = _normalize_prefix(prefix)
+    all_csv_keys_set = set(all_csv_keys)
+    manifest_groups: list[dict] = []  # [{"manifest_key": ..., "entries": [csv_key, ...]}]
+    csv_keys_in_manifests: set[str] = set()
+    manifest_errors: list[str] = []
+    for mkey in manifest_keys:
+        try:
+            entries = _read_manifest_entries(
+                CSV_BUCKET_NAME, mkey, all_csv_keys_set, normalized_prefix,
+            )
+        except ManifestValidationError as e:
+            manifest_errors.append(str(e))
+            logger.warning("manifest validation failed: %s", e)
+            continue
+        except Exception as e:
+            manifest_errors.append(f"manifest '{mkey}' の読み取りに失敗しました: {e}")
+            logger.warning("manifest %s の読み取り失敗: %s", mkey, e)
+            continue
+        if not entries:
+            manifest_errors.append(f"manifest '{mkey}' の entries が空です")
+            logger.warning("manifest %s は空", mkey)
+            continue
+        manifest_groups.append({"manifest_key": mkey, "entries": entries})
+        csv_keys_in_manifests.update(entries)
+
+    if manifest_errors:
+        raise HTTPException(
+            status_code=400,
+            detail="; ".join(manifest_errors),
+        )
+
+    # manifest に取り込まれていない CSV のみを通常ルートで扱う
+    csv_keys = [k for k in all_csv_keys if k not in csv_keys_in_manifests]
+
+    if not csv_keys and not manifest_groups:
+        raise HTTPException(status_code=400, detail="指定された prefix 配下に CSV / manifest ファイルが見つかりません")
 
     def _sse(event_type: str, data: dict) -> str:
         return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -656,12 +819,59 @@ async def analyze(request: Request, body: AnalyzeRequest):
         tables: list[dict] = []
         errors: list[str] = []
 
-        # Phase 0: ヘッダーでグルーピング
-        groups = _group_csv_by_header(CSV_BUCKET_NAME, csv_keys)
-        total = len(groups)
-        logger.info("analyze: %d CSV files grouped into %d groups", len(csv_keys), total)
+        # Phase 0: ヘッダーでグルーピング（manifest 対象外の CSV のみ）
+        csv_groups = _group_csv_by_header(CSV_BUCKET_NAME, csv_keys) if csv_keys else []
+        total = len(manifest_groups) + len(csv_groups)
+        logger.info(
+            "analyze: %d csv + %d manifest → %d table candidates",
+            len(csv_keys), len(manifest_groups), total,
+        )
 
-        for idx, group in enumerate(groups, 1):
+        idx = 0
+
+        # --- manifest ベースのテーブル ---
+        for mg in manifest_groups:
+            idx += 1
+            manifest_key = mg["manifest_key"]
+            entries = mg["entries"]
+            representative_key = entries[0]
+            filename = manifest_key.rsplit("/", 1)[-1]
+            yield _sse("progress", {"step": "analyze_csv", "current": idx, "total": total, "file": filename})
+
+            info = _analyze_csv_file(CSV_BUCKET_NAME, representative_key)
+            if "error" in info:
+                error_msg = info["error"]
+                if "UTF-8 以外" in error_msg:
+                    logger.error("analyze: エンコーディングエラー %s: %s", representative_key, error_msg)
+                    yield _sse("error", {"message": error_msg})
+                    return
+                errors.append(f"{manifest_key}: {error_msg}")
+                logger.warning("analyze: manifest 参照 CSV 読み取りエラー %s: %s", representative_key, error_msg)
+                continue
+            try:
+                logger.info(
+                    "analyze: [%d/%d] manifest=%s (%d entries, rep=%s) を AI 分析中...",
+                    idx, total, manifest_key, len(entries), representative_key,
+                )
+                # manifest の basename をテーブル名ヒントとして渡す
+                table_def = _analyze_single_csv_with_bedrock(
+                    info, entries, table_name_hint=_basename_without_ext(manifest_key),
+                )
+                # s3_keys には manifest キー 1 本のみ格納
+                # （apply 時に .manifest 拡張子で COPY ... MANIFEST に振り分ける）
+                table_def["s3_keys"] = [manifest_key]
+                tables.append(table_def)
+                logger.info(
+                    "analyze: [%d/%d] → テーブル '%s' 完了 (manifest, %d files)",
+                    idx, total, table_def.get("table_name", "?"), len(entries),
+                )
+            except Exception as e:
+                errors.append(f"{manifest_key}: {str(e)}")
+                logger.warning("analyze: [%d/%d] %s AI 分析失敗: %s", idx, total, manifest_key, e)
+
+        # --- 通常 CSV グループベースのテーブル ---
+        for group in csv_groups:
+            idx += 1
             group_keys = group["keys"]
             representative_key = group_keys[0]
             filename = representative_key.rsplit("/", 1)[-1]

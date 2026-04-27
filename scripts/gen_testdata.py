@@ -11,6 +11,8 @@
 
 Usage:
   python gen_testdata.py [--output-dir ./testdata] [--scale default|large] [--multi-csv]
+  python gen_testdata.py --manifest-test [--output-dir ./testdata] \
+      [--manifest-s3-prefix s3://my-bucket/testdata/]
 """
 import argparse
 import csv
@@ -649,6 +651,129 @@ def write_multi_csv_order_items(output_dir: str, order_items: list[dict]) -> Non
         write_csv(os.path.join(output_dir, f"order_items_part{i}.csv"), part)
 
 
+def _split_rows(rows: list[dict], n: int) -> list[list[dict]]:
+    """rows を n 個のチャンクに等分（最後のチャンクが残りを全部吸収）"""
+    if n <= 0:
+        return [rows]
+    # できるだけ均等に分ける
+    size = max(1, len(rows) // n)
+    chunks: list[list[dict]] = []
+    for i in range(n):
+        start = i * size
+        end = (i + 1) * size if i < n - 1 else len(rows)
+        chunks.append(rows[start:end])
+    # もし元が n 未満の場合に空チャンクを入れないようフィルタ
+    return [c for c in chunks if c]
+
+
+def write_manifest(manifest_path: str, s3_prefix: str, rel_keys: list[str]) -> None:
+    """Redshift COPY MANIFEST ファイルを書き出す。
+
+    entries の url は s3_prefix + rel_key の絶対 s3:// URL。
+    ローカルの検証用なら s3_prefix を "s3://your-bucket/your-prefix/" として渡す。
+    """
+    import json as _json
+    entries = [{"url": f"{s3_prefix}{rk}", "mandatory": True} for rk in rel_keys]
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        _json.dump({"entries": entries}, f, ensure_ascii=False, indent=2)
+
+
+def gen_manifest_test(output_dir: str, s3_prefix: str) -> None:
+    """manifest 機能を含む包括的なテストデータを生成する。
+
+    構成:
+      - ヘッダー A (orders スキーマ): 403 ファイル (manifest に 400 + manifest 非参照 3)
+      - ヘッダー B (customers スキーマ): 2 ファイル (全て manifest に含む)
+      - ヘッダー C (products スキーマ): 2 ファイル (manifest なし)
+      - CSV はトップ直下と sub/ 配下に混在配置
+      - A の manifest はトップ直下 (a.manifest)
+      - B の manifest は sub/ 配下 (sub/b.manifest)
+
+    期待されるテーブル構築結果:
+      1. A の manifest テーブル (COPY 1 回で 400 ファイル一括ロード)
+      2. A の CSV 直接テーブル (manifest 非参照の 3 ファイル、同ヘッダーで別テーブル)
+      3. B のテーブル (manifest で 2 ファイル一括)
+      4. C のテーブル (manifest なしで 2 ファイル個別 COPY)
+    """
+    random.seed(42)
+
+    sub_dir = os.path.join(output_dir, "sub")
+    os.makedirs(sub_dir, exist_ok=True)
+
+    # --- ヘッダー A: orders スキーマ ---
+    # 400 ファイル (manifest 参照) + 3 ファイル (manifest 非参照) = 403 ファイル
+    # 1 ファイルあたり 5 行程度の極小データで十分（挙動検証用）
+    # 非参照 3 ファイルと manifest 参照 400 ファイルで同じヘッダを使う
+    customers_for_a = gen_customers(200)  # 適当な customer プール
+    products_for_a = gen_products(50)
+
+    NUM_A_MANIFEST = 400
+    NUM_A_STANDALONE = 3
+    a_manifest_rel_keys: list[str] = []
+
+    # manifest 参照分の 400 ファイル（sub/ 配下と直下に混在）
+    for i in range(NUM_A_MANIFEST):
+        rows = gen_orders(5, customers_for_a)
+        # 偶数番は sub/ 配下、奇数番はトップ直下
+        if i % 2 == 0:
+            rel = f"sub/a_in_manifest_{i:04d}.csv"
+        else:
+            rel = f"a_in_manifest_{i:04d}.csv"
+        write_csv(os.path.join(output_dir, rel), rows)
+        a_manifest_rel_keys.append(rel)
+
+    # manifest 非参照の 3 ファイル（sub/ 配下と直下に混在）
+    a_standalone_rel_keys: list[str] = []
+    for i in range(NUM_A_STANDALONE):
+        rows = gen_orders(5, customers_for_a)
+        if i == 0:
+            rel = "a_standalone_0.csv"
+        elif i == 1:
+            rel = "sub/a_standalone_1.csv"
+        else:
+            rel = "a_standalone_2.csv"
+        write_csv(os.path.join(output_dir, rel), rows)
+        a_standalone_rel_keys.append(rel)
+
+    # A の manifest はトップ直下
+    write_manifest(os.path.join(output_dir, "a.manifest"), s3_prefix, a_manifest_rel_keys)
+
+    # --- ヘッダー B: customers スキーマ ---
+    # 2 ファイル、全て manifest に含む
+    b_parts = _split_rows(gen_customers(20), 2)
+    b_rel_keys = ["b_part1.csv", "sub/b_part2.csv"]  # 直下と sub/ に混在
+    for rel, rows in zip(b_rel_keys, b_parts):
+        write_csv(os.path.join(output_dir, rel), rows)
+
+    # B の manifest は sub/ 配下
+    write_manifest(os.path.join(sub_dir, "b.manifest"), s3_prefix, b_rel_keys)
+
+    # --- ヘッダー C: products スキーマ ---
+    # manifest なし、2 ファイル（直下と sub/ に混在）
+    c_parts = _split_rows(gen_products(20), 2)
+    c_rel_keys = ["c_part1.csv", "sub/c_part2.csv"]
+    for rel, rows in zip(c_rel_keys, c_parts):
+        write_csv(os.path.join(output_dir, rel), rows)
+
+    # --- 出力サマリ ---
+    print(f"manifest テストデータ生成完了: {output_dir}/")
+    print(f"  A ヘッダー (orders スキーマ): {NUM_A_MANIFEST + NUM_A_STANDALONE} ファイル")
+    print(f"    - a.manifest (直下): {NUM_A_MANIFEST} entries")
+    print(f"    - manifest 非参照: {NUM_A_STANDALONE} ファイル")
+    print(f"  B ヘッダー (customers スキーマ): {len(b_rel_keys)} ファイル")
+    print(f"    - sub/b.manifest: {len(b_rel_keys)} entries")
+    print(f"  C ヘッダー (products スキーマ): {len(c_rel_keys)} ファイル (manifest なし)")
+    print()
+    print(f"期待テーブル数: 4")
+    print(f"  1. A ヘッダー/manifest 版 (COPY 1 回で {NUM_A_MANIFEST} ファイル一括ロード)")
+    print(f"  2. A ヘッダー/CSV 直接版 ({NUM_A_STANDALONE} ファイル、個別 COPY)")
+    print(f"  3. B ヘッダー (manifest で {len(b_rel_keys)} ファイル一括)")
+    print(f"  4. C ヘッダー ({len(c_rel_keys)} ファイル、個別 COPY)")
+    print()
+    print(f"manifest の entries URL prefix: {s3_prefix}")
+    print(f"※ S3 アップロード後の prefix と異なる場合は --manifest-s3-prefix で指定し直して再生成してください")
+
+
 def main():
     parser = argparse.ArgumentParser(description="EC サイトテスト用 CSV データ生成")
     parser.add_argument("--output-dir", default="testdata", help="出力ディレクトリ (default: testdata)")
@@ -656,9 +781,26 @@ def main():
                         help="データ規模: default=4テーブル, large=24テーブル (default: default)")
     parser.add_argument("--multi-csv", action="store_true",
                         help="orders / order_items を複数 CSV に分割して出力（複数CSV→1テーブルのテスト用）")
+    parser.add_argument("--manifest-test", action="store_true",
+                        help="manifest 機能の包括テスト用データを生成する "
+                             "(A=403ファイル/400はmanifest、B=2ファイル全てmanifest、C=2ファイルmanifestなし "
+                             "計4テーブル想定、CSV はトップ直下と sub/ 配下に混在配置)")
+    parser.add_argument("--manifest-s3-prefix", default="s3://REPLACE-BUCKET/REPLACE-PREFIX/",
+                        help="manifest entries の url に使う S3 prefix (末尾 / 必須)。"
+                             "例: s3://my-csv-bucket/testdata/ "
+                             "--manifest-test 指定時のみ有効")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # manifest テストモード: 他のオプションに関係なく専用フローを実行
+    if args.manifest_test:
+        s3_prefix = args.manifest_s3_prefix
+        if not s3_prefix.endswith("/"):
+            s3_prefix += "/"
+        gen_manifest_test(args.output_dir, s3_prefix)
+        return
+
     random.seed(42)
 
     customers = gen_customers(NUM_CUSTOMERS)

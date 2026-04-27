@@ -36,6 +36,49 @@ python3 scripts/gen_testdata.py --output-dir ./testdata --scale large
 - CSV ファイルはヘッダー行付きで用意してください
 - エンコーディングは UTF-8 必須です
 
+### 大量 CSV を 1 テーブルにまとめる: manifest の利用（任意）
+
+同一スキーマの CSV が非常に多い（数百本〜）テーブルは、Redshift COPY MANIFEST を使うと 1 回の COPY で一括ロードできます。Data API の同時実行上限に起因するロード滞留を避けたい場合に有効です。
+
+**使い方**
+
+1. 対象の CSV と同じ prefix 配下に `<任意名>.manifest` という JSON ファイルを 1 つ置く
+2. `entries` にまとめたい CSV の絶対 `s3://` URL を列挙する
+
+```json
+{
+  "entries": [
+    { "url": "s3://<CsvBucketName>/sales/2024/01.csv", "mandatory": true },
+    { "url": "s3://<CsvBucketName>/sales/2024/02.csv", "mandatory": true }
+  ]
+}
+```
+
+**挙動**
+
+- analyze 時、`.manifest` ファイルが検出されると 1 テーブルとして扱われる（manifest のファイル名 basename がテーブル名のヒントになる）
+- manifest に列挙された CSV は、通常の CSV 列挙ルートから除外される（二重ロード防止）
+- apply 時、manifest 由来テーブルは `COPY ... MANIFEST` 1 回で全 entry を一括ロードする
+- manifest がない prefix では従来通りファイル毎に COPY される（後方互換）
+
+**制約**
+
+- `entries[].url` は CSV バケット内の絶対 `s3://` URL（別バケット参照は analyze で除外集合に反映されないため非推奨）
+- 同 prefix 配下に、manifest に列挙されていない同ヘッダの CSV が残っている場合、その CSV は別テーブル扱いになる（同 prefix に置いた CSV は全て manifest に含めることを推奨）
+- manifest は Admin UI のローカルアップロード機能では扱えません。アップロード時にディレクトリ構造と URL が維持されないためです。AWS CLI / S3 Console / DataSync 等で S3 に直接配置し、Admin UI の「既存 S3 パス指定」から prefix を指定してください
+
+**動作確認用のテストデータ生成**
+
+manifest を含む包括的な動作確認用データを生成できます（A ヘッダ 403 CSV のうち 400 は manifest、残り 3 は個別 / B ヘッダ 2 CSV は全て manifest / C ヘッダ 2 CSV は manifest なし、計 4 テーブル想定、直下と `sub/` に混在配置）。
+
+```bash
+python3 scripts/gen_testdata.py --manifest-test \
+  --output-dir ./testdata \
+  --manifest-s3-prefix s3://<CsvBucketName>/testdata/
+```
+
+生成後、`./testdata/` を指定の prefix（`--manifest-s3-prefix` と揃える）にアップロードし、Admin UI の Mode B から同 prefix を指定して analyze → apply を実行してください。
+
 ## 2. Upload & Build（テーブル作成）
 
 Admin Frontend にログインし、「Upload & Build」タブで以下の手順を実行します。

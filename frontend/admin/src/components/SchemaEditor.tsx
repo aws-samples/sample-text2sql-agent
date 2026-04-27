@@ -64,10 +64,15 @@ export default function SchemaEditor({ systemPrompt, onSystemPromptChange, dbSch
 
       <Divider />
 
-      {dbSchema.tables.map((table, ti) => (
+      {dbSchema.tables.map((table, ti) => {
+        const isManifestBased = table.s3_keys.some(k => k.toLowerCase().endsWith('.manifest'));
+        return (
         <Accordion key={ti} defaultExpanded>
           <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-            <Typography>{table.table_name || `テーブル ${ti + 1}`}</Typography>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <Typography>{table.table_name || `テーブル ${ti + 1}`}</Typography>
+              {isManifestBased && <Chip label="MANIFEST" size="small" color="primary" variant="outlined" />}
+            </Box>
           </AccordionSummary>
           <AccordionDetails>
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -126,7 +131,8 @@ export default function SchemaEditor({ systemPrompt, onSystemPromptChange, dbSch
             </Box>
           </AccordionDetails>
         </Accordion>
-      ))}
+        );
+      })}
     </Box>
   );
 }

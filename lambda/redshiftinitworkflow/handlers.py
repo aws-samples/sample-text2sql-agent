@@ -175,7 +175,12 @@ def _generate_ddl(table: dict) -> str:
 
 
 def _generate_copy(table: dict) -> list[str]:
-    """s3_keys の各ファイルに対して COPY 文を生成"""
+    """テーブル 1 件分の COPY 文を生成する。
+
+    s3_keys 内の各キーに対して 1 本ずつ COPY を作るが、
+    キーが `.manifest` で終わる場合は `COPY ... MANIFEST` として発行する
+    （1 manifest = 1 COPY で、manifest 内の全 entry をまとめてロード）。
+    """
     opts = table.get("csv_options", {})
     delimiter = opts.get("delimiter", ",")
     quote_char = opts.get("quote_char", '"')
@@ -184,6 +189,7 @@ def _generate_copy(table: dict) -> list[str]:
     statements = []
     for key in table["s3_keys"]:
         s3_path = f"s3://{CSV_BUCKET_NAME}/{key}"
+        is_manifest = key.lower().endswith(".manifest")
 
         copy_sql = (
             f'COPY "{table["table_name"]}" FROM \'{s3_path}\' '
@@ -193,6 +199,8 @@ def _generate_copy(table: dict) -> list[str]:
             f"REGION '{CSV_BUCKET_REGION}'"
             f" ENCODING UTF8"
         )
+        if is_manifest:
+            copy_sql += " MANIFEST"
 
         if quote_char and quote_char != '"':
             copy_sql += f" QUOTE '{quote_char}'"
@@ -263,7 +271,8 @@ def handle_start_build(event, context):
         except Exception as e:
             errors.append(f"CREATE TABLE {table['table_name']}: {str(e)}")
 
-    # c. COPY (非同期、投げるだけ) — 1テーブルに複数 COPY の場合あり
+    # c. COPY (非同期、投げるだけ)
+    #    事前配置された manifest があれば 1 テーブル 1 COPY に集約される
     copy_statements = {}
     for table in tables:
         if table["table_name"] not in tables_created:

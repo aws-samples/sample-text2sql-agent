@@ -8,6 +8,31 @@ async function getAuthHeaders(): Promise<Record<string, string>> {
   return { Authorization: token, 'Content-Type': 'application/json' };
 }
 
+/**
+ * レスポンスが ok でない場合、FastAPI の detail メッセージを含む Error を投げる。
+ * detail が取得できない場合はステータスコードのみ出力する。
+ */
+async function throwIfNotOk(res: Response): Promise<void> {
+  if (res.ok) return;
+  let detail: string | undefined;
+  try {
+    const body = await res.clone().json();
+    if (body && typeof body.detail === 'string') {
+      detail = body.detail;
+    } else if (typeof body === 'string') {
+      detail = body;
+    }
+  } catch {
+    try {
+      const text = await res.text();
+      if (text) detail = text;
+    } catch {
+      // ignore
+    }
+  }
+  throw new Error(detail ? `${res.status}: ${detail}` : `Failed: ${res.status}`);
+}
+
 // ---------------------------------------------------------------------------
 // Agent CRUD
 // ---------------------------------------------------------------------------
@@ -22,7 +47,7 @@ export interface AgentSummary {
 export async function listAgents(): Promise<{ agents: AgentSummary[] }> {
   const headers = await getAuthHeaders();
   const res = await fetch(`${API_ENDPOINT}admin/agents`, { headers });
-  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  await throwIfNotOk(res);
   return res.json();
 }
 
@@ -31,14 +56,14 @@ export async function createAgent(agentName: string): Promise<{ agent_id: string
   const res = await fetch(`${API_ENDPOINT}admin/agents`, {
     method: 'POST', headers, body: JSON.stringify({ agent_name: agentName }),
   });
-  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  await throwIfNotOk(res);
   return res.json();
 }
 
 export async function getAgent(agentId: string) {
   const headers = await getAuthHeaders();
   const res = await fetch(`${API_ENDPOINT}admin/agents/${agentId}`, { headers });
-  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  await throwIfNotOk(res);
   return res.json();
 }
 
@@ -47,7 +72,7 @@ export async function updateAgent(agentId: string, data: { agent_name?: string }
   const res = await fetch(`${API_ENDPOINT}admin/agents/${agentId}`, {
     method: 'PUT', headers, body: JSON.stringify(data),
   });
-  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  await throwIfNotOk(res);
   return res.json();
 }
 
@@ -56,34 +81,34 @@ export async function deleteAgent(agentId: string) {
   const res = await fetch(`${API_ENDPOINT}admin/agents/${agentId}`, {
     method: 'DELETE', headers,
   });
-  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  await throwIfNotOk(res);
   return res.json();
 }
 
 // ---------------------------------------------------------------------------
-// Config (agent_id based)
+// Config
 // ---------------------------------------------------------------------------
 export async function getConfig(agentId: string) {
   const headers = await getAuthHeaders();
   const res = await fetch(`${API_ENDPOINT}admin/config?agent_id=${agentId}`, { headers });
-  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  await throwIfNotOk(res);
   return res.json();
 }
 
 // ---------------------------------------------------------------------------
-// Presigned URLs / List CSV / Analyze (unchanged)
+// Presigned URLs / List CSV / Analyze
 // ---------------------------------------------------------------------------
 export async function getPresignedUrls(filenames: string[]): Promise<{ prefix: string; urls: Record<string, string> }> {
   const headers = await getAuthHeaders();
   const res = await fetch(`${API_ENDPOINT}admin/presigned-urls`, { method: 'POST', headers, body: JSON.stringify({ filenames }) });
-  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  await throwIfNotOk(res);
   return res.json();
 }
 
-export async function listCsv(prefix: string): Promise<{ prefix: string; files: string[] }> {
+export async function listCsv(prefix: string): Promise<{ prefix: string; files: string[]; manifests: string[] }> {
   const headers = await getAuthHeaders();
   const res = await fetch(`${API_ENDPOINT}admin/list-csv`, { method: 'POST', headers, body: JSON.stringify({ prefix }) });
-  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  await throwIfNotOk(res);
   return res.json();
 }
 
@@ -100,7 +125,7 @@ export async function analyze(
 ): Promise<{ system_prompt: string; db_schema: any }> {
   const headers = await getAuthHeaders();
   const res = await fetch(`${API_ENDPOINT}admin/analyze`, { method: 'POST', headers, body: JSON.stringify({ prefix }) });
-  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  await throwIfNotOk(res);
 
   const reader = res.body?.getReader();
   if (!reader) throw new Error('ReadableStream not supported');
@@ -151,7 +176,7 @@ export async function apply(prefix: string, systemPrompt: string, dbSchema: any,
     method: 'POST', headers,
     body: JSON.stringify({ prefix, system_prompt: systemPrompt, db_schema: dbSchema, agent_name: agentName }),
   });
-  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  await throwIfNotOk(res);
   return res.json();
 }
 
@@ -169,7 +194,7 @@ export async function getApplyStatus(executionId: string): Promise<{ status: str
     method: 'POST', headers,
     body: JSON.stringify({ execution_id: executionId }),
   });
-  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  await throwIfNotOk(res);
   return res.json();
 }
 
@@ -182,7 +207,7 @@ export async function updateKnowledge(agentId: string, knowledge: string[]) {
     method: 'POST', headers,
     body: JSON.stringify({ agent_id: agentId, skills: knowledge }),
   });
-  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  await throwIfNotOk(res);
   return res.json();
 }
 
@@ -192,7 +217,7 @@ export async function updateKnowledge(agentId: string, knowledge: string[]) {
 export async function getSystemPrompt(agentId: string): Promise<{ system_prompt: string }> {
   const headers = await getAuthHeaders();
   const res = await fetch(`${API_ENDPOINT}admin/system-prompt?agent_id=${agentId}`, { headers });
-  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  await throwIfNotOk(res);
   return res.json();
 }
 
@@ -202,6 +227,6 @@ export async function updateSystemPrompt(agentId: string, systemPrompt: string) 
     method: 'PUT', headers,
     body: JSON.stringify({ agent_id: agentId, system_prompt: systemPrompt }),
   });
-  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  await throwIfNotOk(res);
   return res.json();
 }

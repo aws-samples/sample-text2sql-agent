@@ -3,7 +3,7 @@ import {
   Box, Typography, RadioGroup, FormControlLabel, Radio,
   Button, TextField, Alert, CircularProgress, Backdrop,
   List, ListItem, ListItemIcon, ListItemText,
-  Stepper, Step, StepLabel,
+  Stepper, Step, StepLabel, Chip,
 } from '@mui/material';
 import InsertDriveFileIcon from '@mui/icons-material/InsertDriveFile';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
@@ -24,6 +24,7 @@ export default function UploadAndBuild() {
   // Mode B state
   const [s3Prefix, setS3Prefix] = useState('');
   const [listedFiles, setListedFiles] = useState<string[] | null>(null);
+  const [listedManifests, setListedManifests] = useState<string[] | null>(null);
 
   // Shared
   const [prefix, setPrefix] = useState<string | null>(null);
@@ -87,14 +88,16 @@ export default function UploadAndBuild() {
     setLoadingMessage('ファイル一覧を取得中...');
     setError(null);
     setListedFiles(null);
+    setListedManifests(null);
     try {
       const inputPrefix = s3Prefix.trim();
-      const { files: csvFiles } = await api.listCsv(inputPrefix);
-      if (csvFiles.length === 0) {
-        setError('指定された prefix 配下に CSV ファイルが見つかりません');
+      const { files: csvFiles, manifests } = await api.listCsv(inputPrefix);
+      if (csvFiles.length === 0 && manifests.length === 0) {
+        setError('指定された prefix 配下に CSV / manifest ファイルが見つかりません');
         return;
       }
       setListedFiles(csvFiles);
+      setListedManifests(manifests);
       // ユーザー入力をそのまま保持（バックエンドの正規化結果は捨てる）
       setPrefix(inputPrefix);
       setActiveStep(1);
@@ -191,7 +194,9 @@ export default function UploadAndBuild() {
   const step1Summary = prefix !== null
     ? mode === 'upload'
       ? `${files.length} ファイルアップロード済み (${prefix})`
-      : `S3: ${prefix} (${listedFiles?.length ?? 0} ファイル)`
+      : `S3: ${prefix} (${listedFiles?.length ?? 0} CSV`
+        + (listedManifests && listedManifests.length > 0 ? `, ${listedManifests.length} manifest` : '')
+        + ')'
     : null;
 
   const step2Summary = analyzeResult
@@ -229,12 +234,18 @@ export default function UploadAndBuild() {
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
               <input ref={fileInputRef} type="file" accept=".csv" multiple hidden onChange={handleFilesChosen} />
               <Button variant="outlined" onClick={handleFileSelect}>CSV ファイルを選択</Button>
+              <Typography variant="caption" color="text.secondary">
+                manifest を使った大量 CSV の一括ロードには、このローカルアップロードではなく「既存 S3 パス指定」を利用してください（ローカルアップロードではディレクトリ構造と URL が保持されず manifest が機能しません）。
+              </Typography>
               {files.length > 0 && (
                 <List dense>
                   {files.map(f => (
                     <ListItem key={f.name}>
                       <ListItemIcon><InsertDriveFileIcon /></ListItemIcon>
-                      <ListItemText primary={f.name} secondary={`${(f.size / 1024).toFixed(1)} KB`} />
+                      <ListItemText
+                        primary={f.name}
+                        secondary={`${(f.size / 1024).toFixed(1)} KB`}
+                      />
                       {uploadedFiles.has(f.name) && <CheckCircleIcon color="success" sx={{ ml: 1 }} />}
                     </ListItem>
                   ))}
@@ -251,20 +262,53 @@ export default function UploadAndBuild() {
               <TextField
                 label="S3 Prefix" placeholder="バケット内のパスのみ入力（例: testdata/）"
                 value={s3Prefix} onChange={e => setS3Prefix(e.target.value)}
-                helperText="CSV バケット内のフォルダパスを入力してください。バケット名や s3:// は不要です。"
+                helperText="CSV バケット内のフォルダパスを入力してください。バケット名や s3:// は不要です。サブディレクトリ配下の CSV も自動で再帰的に列挙されます。同プレフィックス配下に <任意名>.manifest を置くと、そのテーブルは COPY 1 回にまとめられます。"
               />
               <Button variant="contained" onClick={handleListCsv} disabled={!s3Prefix.trim()}>
                 ファイル一覧取得
               </Button>
-              {listedFiles && (
-                <List dense>
-                  {listedFiles.map(f => (
-                    <ListItem key={f}>
-                      <ListItemIcon><InsertDriveFileIcon /></ListItemIcon>
-                      <ListItemText primary={f} />
-                    </ListItem>
-                  ))}
-                </List>
+              {listedManifests && listedManifests.length > 0 && (
+                <Box>
+                  <Typography variant="subtitle2" sx={{ mt: 1 }}>
+                    Manifest ファイル ({listedManifests.length})
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    各 manifest は 1 テーブルとして扱われ、entries に列挙された CSV を COPY 1 回でまとめてロードします。
+                  </Typography>
+                  <List dense>
+                    {listedManifests.map(f => (
+                      <ListItem key={`m-${f}`}>
+                        <ListItemIcon><InsertDriveFileIcon /></ListItemIcon>
+                        <ListItemText
+                          primary={
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                              <span>{f}</span>
+                              <Chip label="MANIFEST" size="small" color="primary" variant="outlined" />
+                            </Box>
+                          }
+                        />
+                      </ListItem>
+                    ))}
+                  </List>
+                </Box>
+              )}
+              {listedFiles && listedFiles.length > 0 && (
+                <Box>
+                  <Typography variant="subtitle2" sx={{ mt: 1 }}>
+                    CSV ファイル ({listedFiles.length})
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    manifest に含まれている CSV は除外されます。残った CSV はヘッダが一致するものごとにテーブル化されます。
+                  </Typography>
+                  <List dense>
+                    {listedFiles.map(f => (
+                      <ListItem key={`c-${f}`}>
+                        <ListItemIcon><InsertDriveFileIcon /></ListItemIcon>
+                        <ListItemText primary={f} />
+                      </ListItem>
+                    ))}
+                  </List>
+                </Box>
               )}
             </Box>
           )}
