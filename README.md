@@ -6,7 +6,7 @@ CSV を S3 に置くだけで、自社データに対して自然言語で問い
 
 ## ✨特徴
 
-- 🚀 **ワンクリックデプロイ** — AWS アカウントがあれば、[ここ（準備中）]() からすぐにデプロイ可能
+- 🚀 **ワンクリックデプロイ** — AWS アカウントがあれば、[ここ](https://aws-samples.github.io/sample-one-click-generative-ai-solutions/solutions/d360/) からすぐにデプロイ可能
 - 📁 **CSV アップロードで即開始** — S3 に CSV を置くだけで AI がスキーマを自動生成
 - 🗣️ **自然言語でデータに問い合わせ** — SQL を書かずに、日本語で質問するだけ
 - 📊 **チャート自動生成** — 棒グラフ・折れ線グラフ・円グラフを AI が自動で描画
@@ -42,7 +42,7 @@ CSV を S3 に置くだけで、自社データに対して自然言語で問い
 
 ## 🚀 クイックスタート
 
-- [ワンクリックデプロイ（準備中）]() から簡単にデプロイできます。
+- [ワンクリックデプロイ](https://aws-samples.github.io/sample-one-click-generative-ai-solutions/solutions/d360/) から簡単にデプロイできます。
 - cdk でデプロイする場合は、[手動デプロイ手順](docs/MANUAL_DEPLOYMENT.md) を参照してください。
 
 
