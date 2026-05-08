@@ -17,12 +17,15 @@ export interface CsvStorageProps {
  */
 export class CsvStorage extends Construct {
   readonly bucket: s3.IBucket;
+  /** true のとき cdk.json で指定された既存バケットを参照している */
+  readonly isExisting: boolean;
 
   constructor(scope: Construct, id: string, props: CsvStorageProps) {
     super(scope, id);
 
     if (props.existingBucketName) {
       this.bucket = s3.Bucket.fromBucketName(this, 'ExistingBucket', props.existingBucketName);
+      this.isExisting = true;
     } else {
       this.bucket = new s3.Bucket(this, 'CsvInputBucket', {
         blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -38,6 +41,7 @@ export class CsvStorage extends Construct {
           },
         ],
       });
+      this.isExisting = false;
     }
   }
 }

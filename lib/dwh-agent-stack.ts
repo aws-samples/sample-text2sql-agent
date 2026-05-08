@@ -84,6 +84,7 @@ export class DwhAgentStack extends cdk.Stack {
       bedrockModelId: props.bedrockModelId,
       redshift,
       csvBucket: csvStorage.bucket,
+      csvBucketIsExisting: csvStorage.isExisting,
       redshiftAdminRoleArn: redshiftAdminRole.roleArn,
       regionalWaf,
       webAclArn: props.webAclArn,

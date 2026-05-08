@@ -20,6 +20,8 @@ export interface AdminBackendProps {
   bedrockModelId: string;
   redshift: RedshiftServerless;
   csvBucket: s3.IBucket;
+  /** 既存バケットを参照しているか (true のときフロントエンドでローカルアップロードを無効化) */
+  csvBucketIsExisting: boolean;
   redshiftAdminRoleArn: string;
   regionalWaf: RegionalWaf;
   webAclArn: string;
@@ -127,6 +129,8 @@ export class AdminBackend extends Construct {
         VITE_APP_API_ENDPOINT: this.api.url,
         VITE_APP_USER_POOL_ID: this.cognito.userPool.userPoolId,
         VITE_APP_USER_POOL_CLIENT_ID: this.cognito.userPoolClient.userPoolClientId,
+        VITE_APP_CSV_BUCKET_NAME: props.csvBucket.bucketName,
+        VITE_APP_CSV_BUCKET_IS_EXISTING: props.csvBucketIsExisting ? 'true' : 'false',
       },
     });
   }

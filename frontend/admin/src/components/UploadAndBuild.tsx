@@ -3,7 +3,7 @@ import {
   Box, Typography, RadioGroup, FormControlLabel, Radio,
   Button, TextField, Alert, CircularProgress, Backdrop,
   List, ListItem, ListItemIcon, ListItemText,
-  Stepper, Step, StepLabel, Chip,
+  Stepper, Step, StepLabel, Chip, Tooltip,
 } from '@mui/material';
 import InsertDriveFileIcon from '@mui/icons-material/InsertDriveFile';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
@@ -12,9 +12,15 @@ import * as api from '../api';
 
 const STEPS = ['CSV 指定', 'AI 分析', '確認・編集', 'テーブル構築'];
 
+// ビルド時に CDK から注入される CSV バケット情報
+const CSV_BUCKET_NAME = import.meta.env.VITE_APP_CSV_BUCKET_NAME as string;
+const CSV_BUCKET_IS_EXISTING =
+  (import.meta.env.VITE_APP_CSV_BUCKET_IS_EXISTING as string | undefined) === 'true';
+
 export default function UploadAndBuild() {
   const [activeStep, setActiveStep] = useState(0);
-  const [mode, setMode] = useState<'upload' | 's3'>('upload');
+  // 既存バケットの場合は CORS 設定が無い前提でアップロードを封じ、常に S3 指定モードにする
+  const [mode, setMode] = useState<'upload' | 's3'>(CSV_BUCKET_IS_EXISTING ? 's3' : 'upload');
 
   // Mode A state
   const [files, setFiles] = useState<File[]>([]);
@@ -226,7 +232,24 @@ export default function UploadAndBuild() {
       {activeStep === 0 && (
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
           <RadioGroup row value={mode} onChange={(_, v) => { setMode(v as any); setError(null); }}>
-            <FormControlLabel value="upload" control={<Radio />} label="ローカルファイルアップロード" />
+            <Tooltip
+              title={CSV_BUCKET_IS_EXISTING
+                ? '既存バケットは CORS 設定が無いためブラウザからの直接アップロードはできません。CSV を S3 に配置してから「既存 S3 パス指定」でご利用ください。'
+                : ''}
+              disableHoverListener={!CSV_BUCKET_IS_EXISTING}
+              disableFocusListener={!CSV_BUCKET_IS_EXISTING}
+              disableTouchListener={!CSV_BUCKET_IS_EXISTING}
+            >
+              {/* disabled 要素はイベントを発火しないため span でラップして Tooltip を機能させる */}
+              <span>
+                <FormControlLabel
+                  value="upload"
+                  control={<Radio />}
+                  label="ローカルファイルアップロード"
+                  disabled={CSV_BUCKET_IS_EXISTING}
+                />
+              </span>
+            </Tooltip>
             <FormControlLabel value="s3" control={<Radio />} label="既存 S3 パス指定" />
           </RadioGroup>
 
@@ -259,10 +282,20 @@ export default function UploadAndBuild() {
 
           {mode === 's3' && (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <Typography variant="caption" color="text.secondary">
+                CSV バケット:{' '}
+                <Box component="span" sx={{ fontFamily: 'monospace' }}>{CSV_BUCKET_NAME}</Box>
+              </Typography>
               <TextField
-                label="S3 Prefix" placeholder="バケット内のパスのみ入力（例: testdata/）"
+                label="S3 プレフィックス"
+                placeholder="例: testdata/"
                 value={s3Prefix} onChange={e => setS3Prefix(e.target.value)}
-                helperText="CSV バケット内のフォルダパスを入力してください。バケット名や s3:// は不要です。サブディレクトリ配下の CSV も自動で再帰的に列挙されます。同プレフィックス配下に <任意名>.manifest を置くと、そのテーブルは COPY 1 回にまとめられます。"
+                helperText={
+                  '上記バケット内のフォルダパス（キーのプレフィックス）を入力してください。'
+                  + ' バケット名や s3:// プレフィックスは不要です。'
+                  + ' サブディレクトリ配下の CSV も自動で再帰的に列挙されます。'
+                  + ' 同プレフィックス配下に <任意名>.manifest を置くと、そのテーブルは COPY 1 回にまとめられます。'
+                }
               />
               <Button variant="contained" onClick={handleListCsv} disabled={!s3Prefix.trim()}>
                 ファイル一覧取得

@@ -22,7 +22,7 @@ npm ci
 | `allowOrigin` | CORS 許可オリジン | `*` |
 | `allowedCidrs` | WAF IP 制限 (CIDR) | `["0.0.0.0/1", "128.0.0.0/1"]` (全許可) |
 | `bedrockModelId` | Bedrock モデル ID | `global.anthropic.claude-sonnet-4-6` |
-| `csvInputBucketName` | 既存 CSV バケット名 (省略時は新規作成) | 未設定 |
+| `csvInputBucketName` | 既存 CSV バケット名 (省略時は新規作成)。既存バケットを指定した場合、Admin UI のローカルアップロード機能は無効化され、「既存 S3 パス指定」のみ利用可能になります（ブラウザ直 PUT に必要な CORS 設定を行わない前提のため） | 未設定 |
 | `sqlResultThreshold` | Agent SQL 結果の行数上限 | `200` |
 | `enablePromptCache` | Bedrock Prompt Cache の有効/無効 | `true` |
 | `stackPrefix` | スタック名のプレフィックス。同一 AWS アカウントに複数環境をデプロイする場合に指定 (例: `Dev`, `Stg`, `TeamA`, `TeamB`) | `""` (空文字) |
