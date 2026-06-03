@@ -29,10 +29,14 @@ app = BedrockAgentCoreApp()
 # 環境変数
 SESSIONS_TABLE_NAME = os.environ["SESSIONS_TABLE_NAME"]
 CONFIG_TABLE_NAME = os.environ["CONFIG_TABLE_NAME"]
+FILES_TABLE_NAME = os.environ["FILES_TABLE_NAME"]
 BEDROCK_MODEL_ID = os.environ["BEDROCK_MODEL_ID"]
 REDSHIFT_WORKGROUP_NAME = os.environ["REDSHIFT_WORKGROUP_NAME"]
 REDSHIFT_DATABASE = os.environ["REDSHIFT_DATABASE"]
 REDSHIFT_SECRET_ARN = os.environ["REDSHIFT_SECRET_ARN"]
+DOWNLOAD_BUCKET_NAME = os.environ["DOWNLOAD_BUCKET_NAME"]
+DOWNLOAD_PRESIGN_TTL_SECONDS = int(os.environ["DOWNLOAD_PRESIGN_TTL_SECONDS"])
+REDSHIFT_UNLOAD_IAM_ROLE_ARN = os.environ["REDSHIFT_UNLOAD_IAM_ROLE_ARN"]
 ENABLE_PROMPT_CACHE = os.environ.get("ENABLE_PROMPT_CACHE", "false").lower() == "true"
 
 dynamodb = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION"))
@@ -92,6 +96,11 @@ def build_system_prompt(config: dict) -> str:
     if schema_str:
         base += f"\n\n## データベーススキーマ\n{schema_str}"
     base += "\n\n分析結果を可視化すべき場合は _render_chart ツールを活用してください。"
+    base += (
+        "\n\n結果が 200 行を超える、または超える可能性が高いと判断した場合は、"
+        "ユーザーに確認したうえで _create_csv_file ツールで CSV ダウンロードリンクを提供してください。"
+        "ユーザーから明示的に CSV ダウンロードを要求された場合も同ツールを使用してください。"
+    )
     return base
 
 
@@ -122,7 +131,14 @@ def build_agent(
     user_id: str, session_id: str, config: dict, agent_id: str, title: str = "",
 ) -> tuple[Agent, ToolSharedState]:
     tools, shared_state = create_tools(
-        REDSHIFT_WORKGROUP_NAME, REDSHIFT_DATABASE, REDSHIFT_SECRET_ARN,
+        REDSHIFT_WORKGROUP_NAME,
+        REDSHIFT_DATABASE,
+        REDSHIFT_SECRET_ARN,
+        user_id=user_id,
+        download_bucket=DOWNLOAD_BUCKET_NAME,
+        files_table_name=FILES_TABLE_NAME,
+        presign_ttl_seconds=DOWNLOAD_PRESIGN_TTL_SECONDS,
+        redshift_unload_iam_role=REDSHIFT_UNLOAD_IAM_ROLE_ARN,
     )
 
     # skills の読み込み (Strands AgentSkills Plugin)
@@ -226,7 +242,7 @@ async def invoke(payload, context: RequestContext) -> AsyncGenerator[dict, None]
                     pending_tools[tool_id] = tool_info
 
             else:
-                # --- チャート SSE（start_event_loop 時に flush）---
+                # --- チャート / CSV ダウンロードイベント (start_event_loop 時に flush) ---
                 if event.get("start_event_loop"):
                     for chart_spec in shared_state.pop_chart_specs():
                         logger.info(
@@ -235,6 +251,20 @@ async def invoke(payload, context: RequestContext) -> AsyncGenerator[dict, None]
                         )
 
                         yield convert_decimals({"type": "chart", "spec": chart_spec})
+
+                    for csv_info in shared_state.pop_csv_files():
+                        logger.info(
+                            "[invoke] sending csv_url: file_id=%s filename=%s",
+                            csv_info.get("file_id"), csv_info.get("filename"),
+                        )
+                        yield {
+                            "type": "csv_url",
+                            "file_id": csv_info["file_id"],
+                            "url": csv_info["url"],
+                            "filename": csv_info["filename"],
+                            "expires_at": csv_info["expires_at"],
+                            "description": csv_info.get("description", ""),
+                        }
 
                 # --- messageStop で tool_use をフラッシュ ---
                 raw_event = event.get("event", {})
@@ -247,6 +277,19 @@ async def invoke(payload, context: RequestContext) -> AsyncGenerator[dict, None]
         # ストリーム終了後に残った pending をフラッシュ
         for item in flush_all_pending():
             yield item
+
+        # チャート / CSV のフラッシュ漏れも回収する (最後のターンで生成された場合)
+        for chart_spec in shared_state.pop_chart_specs():
+            yield convert_decimals({"type": "chart", "spec": chart_spec})
+        for csv_info in shared_state.pop_csv_files():
+            yield {
+                "type": "csv_url",
+                "file_id": csv_info["file_id"],
+                "url": csv_info["url"],
+                "filename": csv_info["filename"],
+                "expires_at": csv_info["expires_at"],
+                "description": csv_info.get("description", ""),
+            }
 
     except Exception as e:
         logger.exception("invoke() error: %s", e)

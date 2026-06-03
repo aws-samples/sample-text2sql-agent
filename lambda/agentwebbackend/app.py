@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import re
+import time
 
 import boto3
 import boto3.dynamodb.conditions
@@ -22,11 +24,17 @@ logger = logging.getLogger(__name__)
 ALLOW_ORIGIN = os.environ["ALLOW_ORIGIN"]
 SESSIONS_TABLE_NAME = os.environ["SESSIONS_TABLE_NAME"]
 CONFIG_TABLE_NAME = os.environ["CONFIG_TABLE_NAME"]
+FILES_TABLE_NAME = os.environ["FILES_TABLE_NAME"]
 AGENTCORE_RUNTIME_ARN = os.environ["AGENTCORE_RUNTIME_ARN"]
+DOWNLOAD_BUCKET_NAME = os.environ["DOWNLOAD_BUCKET_NAME"]
+DOWNLOAD_PRESIGN_TTL_SECONDS = int(os.environ["DOWNLOAD_PRESIGN_TTL_SECONDS"])
 
 dynamodb = boto3.resource("dynamodb")
 sessions_table = dynamodb.Table(SESSIONS_TABLE_NAME)
 config_table = dynamodb.Table(CONFIG_TABLE_NAME)
+files_table = dynamodb.Table(FILES_TABLE_NAME)
+
+s3_client = boto3.client("s3")
 
 # AgentCore クライアント（長時間ストリーミング対応）
 brconfig = Config(
@@ -44,6 +52,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# _create_csv_file の戻り値文字列から file_id を抜き出すパターン
+_CSV_FILE_ID_PATTERN = re.compile(r"file_id=([0-9a-fA-F-]+)")
+
 
 # ---------------------------------------------------------------------------
 # Auth helpers
@@ -60,6 +71,61 @@ def get_user_id_from_request(request: Request) -> str:
         except (json.JSONDecodeError, AttributeError):
             pass
     raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# ---------------------------------------------------------------------------
+# CSV 関連ヘルパー
+# ---------------------------------------------------------------------------
+def regenerate_presigned_url(user_id: str, file_id: str) -> dict:
+    """FilesTable + S3 から presigned URL を再発行する。
+
+    戻り値は呼び出し側が状態を区別できるよう構造化する:
+      - {"status": "ready", "url", "filename", "expires_at"}
+      - {"status": "not_found"}
+      - {"status": "expired", "filename"}
+      - {"status": "objects_missing", "filename"}
+
+    No Silent Fallbacks: 「正常な空結果」を返さず、すべて状態フィールドで区別する。
+    """
+    resp = files_table.get_item(Key={"user_id": user_id, "file_id": file_id})
+    item = resp.get("Item")
+    if not item:
+        return {"status": "not_found"}
+
+    filename = item.get("filename", "")
+
+    # 期限切れチェック
+    expires_at = int(item.get("expires_at", 0))
+    if expires_at < int(time.time()):
+        return {"status": "expired", "filename": filename}
+
+    s3_prefix = item.get("s3_prefix", "")
+    objects = s3_client.list_objects_v2(Bucket=DOWNLOAD_BUCKET_NAME, Prefix=s3_prefix)
+    contents = objects.get("Contents") or []
+    if not contents:
+        # メタデータは残っているのに S3 のファイルが消えている (ライフサイクル削除等)
+        logger.error(
+            "regenerate_presigned_url: S3 objects missing for prefix=%s user_id=%s file_id=%s",
+            s3_prefix, user_id, file_id,
+        )
+        return {"status": "objects_missing", "filename": filename}
+
+    key = contents[0]["Key"]
+    url = s3_client.generate_presigned_url(
+        "get_object",
+        Params={
+            "Bucket": DOWNLOAD_BUCKET_NAME,
+            "Key": key,
+            "ResponseContentDisposition": f'attachment; filename="{filename}"',
+        },
+        ExpiresIn=DOWNLOAD_PRESIGN_TTL_SECONDS,
+    )
+    return {
+        "status": "ready",
+        "url": url,
+        "filename": filename,
+        "expires_at": expires_at,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +206,7 @@ async def chat(request: Request, body: ChatRequest):
 
 
 # ---------------------------------------------------------------------------
-# Sessions API（既存と同一、変更なし）
+# Sessions API
 # ---------------------------------------------------------------------------
 @app.get("/sessions")
 async def get_sessions(request: Request, agent_id: str | None = None):
@@ -164,8 +230,12 @@ async def get_sessions(request: Request, agent_id: str | None = None):
     return JSONResponse(content={"sessions": sessions})
 
 
-def _strands_to_display_messages(agent_messages: list[dict]) -> list[dict]:
-    """Strands 生メッセージをフロント表示用に変換する。"""
+def _strands_to_display_messages(agent_messages: list[dict], user_id: str) -> list[dict]:
+    """Strands 生メッセージをフロント表示用に変換する。
+
+    `_create_csv_file` の toolUse / toolResult を検出した場合、
+    FilesTable から presigned URL を再発行して toolUse エントリに添付する。
+    """
     display = []
     tool_use_by_id: dict[str, dict] = {}
 
@@ -190,6 +260,11 @@ def _strands_to_display_messages(agent_messages: list[dict]) -> list[dict]:
                     if tool_name == "_redshift_query":
                         entry["sql"] = tool_input.get("sql_query", "")
                         entry["description"] = tool_input.get("description", "")
+                    elif tool_name == "_create_csv_file":
+                        entry["sql"] = tool_input.get("sql_query", "")
+                        entry["description"] = tool_input.get("description", "")
+                        # csv_status / url は後段の toolResult 処理で埋める
+                        entry["csv_status"] = "pending"
 
                     tool_uses.append(entry)
                     if tool_use_id:
@@ -214,14 +289,52 @@ def _strands_to_display_messages(agent_messages: list[dict]) -> list[dict]:
                 if "toolResult" in block:
                     tr = block["toolResult"]
                     tool_use_id = tr.get("toolUseId", "")
-                    for c in tr.get("content", []):
-                        if "text" in c:
-                            try:
-                                parsed = json.loads(c["text"])
-                                if "chart_spec" in parsed and tool_use_id in tool_use_by_id:
-                                    tool_use_by_id[tool_use_id]["chart_spec"] = parsed["chart_spec"]
-                            except (json.JSONDecodeError, KeyError):
-                                pass
+                    entry = tool_use_by_id.get(tool_use_id)
+                    if not entry:
+                        continue
+
+                    # toolResult のテキストを連結
+                    text_blocks = [c.get("text", "") for c in tr.get("content", []) if "text" in c]
+                    full_text = "".join(text_blocks)
+
+                    if entry.get("tool") == "_render_chart":
+                        # _render_chart は chart_spec を JSON で返す
+                        try:
+                            parsed = json.loads(full_text)
+                            if "chart_spec" in parsed:
+                                entry["chart_spec"] = parsed["chart_spec"]
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+
+                    elif entry.get("tool") == "_create_csv_file":
+                        # 戻り値は "CSV file created. file_id=<uuid>" 形式
+                        m = _CSV_FILE_ID_PATTERN.search(full_text)
+                        if not m:
+                            # ツール内で失敗したケース (戻り値が "CSV ファイル作成失敗..." など)
+                            entry["csv_status"] = "failed"
+                            entry["error_message"] = full_text[:300]
+                            continue
+                        file_id = m.group(1)
+                        entry["file_id"] = file_id
+                        try:
+                            result = regenerate_presigned_url(user_id, file_id)
+                        except Exception as e:
+                            # presigned URL 発行失敗。ユーザー越境ではないので 5xx 相当
+                            logger.exception(
+                                "regenerate_presigned_url unexpected error: user_id=%s file_id=%s",
+                                user_id, file_id,
+                            )
+                            entry["csv_status"] = "error"
+                            entry["error_message"] = str(e)[:300]
+                            continue
+                        status = result["status"]
+                        entry["csv_status"] = status
+                        if status == "ready":
+                            entry["url"] = result["url"]
+                            entry["filename"] = result["filename"]
+                            entry["expires_at"] = result["expires_at"]
+                        elif status in ("expired", "objects_missing"):
+                            entry["filename"] = result.get("filename", "")
 
             if not texts:
                 continue
@@ -242,7 +355,7 @@ async def get_session(session_id: str, request: Request):
         return JSONResponse(content={"session_id": session_id, "messages": []})
 
     raw_messages = item.get("agent_messages", {}).get("default", [])
-    display = _strands_to_display_messages(convert_decimals(raw_messages))
+    display = _strands_to_display_messages(convert_decimals(raw_messages), user_id)
 
     return JSONResponse(content={
         "session_id": session_id,
@@ -255,3 +368,34 @@ async def delete_session(session_id: str, request: Request):
     user_id = get_user_id_from_request(request)
     sessions_table.delete_item(Key={"user_id": user_id, "session_id": session_id})
     return JSONResponse(content={"message": "Session deleted", "session_id": session_id})
+
+
+# ---------------------------------------------------------------------------
+# CSV ダウンロード API
+# ---------------------------------------------------------------------------
+@app.get("/csv/{file_id}")
+async def get_csv_url(file_id: str, request: Request):
+    """presigned URL を任意のタイミングで再発行する (失効時の再要求用)。
+
+    No Silent Fallbacks: not_found / expired / objects_missing をそれぞれ
+    別のステータスコードでフロントに返す。
+    """
+    user_id = get_user_id_from_request(request)
+
+    result = regenerate_presigned_url(user_id, file_id)
+    status = result["status"]
+
+    if status == "not_found":
+        raise HTTPException(status_code=404, detail="File not found")
+    if status == "expired":
+        raise HTTPException(status_code=410, detail="File expired")
+    if status == "objects_missing":
+        # メタデータは残っているが S3 オブジェクトが消えている
+        raise HTTPException(status_code=410, detail="File objects missing in storage")
+
+    # status == "ready"
+    return JSONResponse(content={
+        "url": result["url"],
+        "filename": result["filename"],
+        "expires_at": result["expires_at"],
+    })

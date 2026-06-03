@@ -4,6 +4,7 @@ import { Construct } from 'constructs';
 import { Database } from './database';
 import { RedshiftServerless } from './redshift-serverless';
 import { CsvStorage } from './csv-storage';
+import { CsvDownloadStorage } from './csv-download-storage';
 import { AgentBackend } from './agent-backend';
 import { AdminBackend } from './admin-backend';
 import { RegionalWaf } from './regional-waf';
@@ -23,6 +24,10 @@ export interface DwhAgentStackProps extends cdk.StackProps {
   testAgentUser: string;
   /** Admin UserPool に作るテストユーザー名 (空の場合は作らない) */
   testAdminUser: string;
+  /** CSV ダウンロードファイルの S3 保持日数 (default: 7) */
+  csvDownloadExpirationDays?: number;
+  /** CSV ダウンロード presigned URL の有効秒数 (default: 3600) */
+  csvDownloadPresignTtlSeconds?: number;
 }
 
 export class DwhAgentStack extends cdk.Stack {
@@ -40,14 +45,32 @@ export class DwhAgentStack extends cdk.Stack {
       allowOrigin: props.allowOrigin,
     });
 
+    // CSV ダウンロード機能用バケット
+    const csvDownloadStorage = new CsvDownloadStorage(this, 'CsvDownloadStorage', {
+      expirationDays: props.csvDownloadExpirationDays ?? 7,
+    });
+
     const redshiftAdminRole = new iam.Role(this, 'RedshiftAdminRole', {
       assumedBy: new iam.ServicePrincipal('redshift.amazonaws.com'),
-      description: 'Role for Redshift Serverless to read CSV from S3 via COPY command',
+      description: 'Role for Redshift Serverless to read CSV from S3 (COPY)',
     });
     csvStorage.bucket.grantRead(redshiftAdminRole);
 
+    // UNLOAD 専用 Role (CSV ダウンロード機能用)
+    // - agent_readonly が発行する SQL は _validate_sql_for_unload で UNLOAD キーワードを禁止しているが、
+    //   万一バリデーションをすり抜けても IAM レベルで input バケットへのアクセスや
+    //   攻撃者バケットへの書き込みを拒否できるよう、admin Role と権限を完全に分離する。
+    // - download bucket への ReadWrite のみ付与 (Read は presigned URL 発行とは独立。
+    //   Redshift が UNLOAD 完了確認に使う)。input bucket への権限は持たせない。
+    const redshiftUnloadRole = new iam.Role(this, 'RedshiftUnloadRole', {
+      assumedBy: new iam.ServicePrincipal('redshift.amazonaws.com'),
+      description: 'Role for Redshift Serverless to UNLOAD CSV download files (least privilege)',
+    });
+    csvDownloadStorage.bucket.grantReadWrite(redshiftUnloadRole);
+
     const redshift = new RedshiftServerless(this, 'Redshift', {
       adminRole: redshiftAdminRole,
+      unloadRole: redshiftUnloadRole,
     });
 
     const regionalWaf = new RegionalWaf(this, 'RegionalWaf', {
@@ -64,6 +87,7 @@ export class DwhAgentStack extends cdk.Stack {
       allowedCidrs: props.allowedCidrs,
       sessionsTable: database.sessionsTable,
       configTable: database.configTable,
+      filesTable: database.filesTable,
       bedrockModelId: props.bedrockModelId,
       redshift,
       regionalWaf,
@@ -71,6 +95,13 @@ export class DwhAgentStack extends cdk.Stack {
       sqlResultThreshold: props.sqlResultThreshold,
       enablePromptCache: props.enablePromptCache,
       testUsername: props.testAgentUser,
+      downloadBucket: csvDownloadStorage.bucket,
+      // UNLOAD 専用 Role の ARN を明示指定する。
+      // `IAM_ROLE default` には頼らず、SQL 内で常に Role ARN を埋め込む。
+      // これにより Namespace の defaultIamRoleArn 設定の如何に関わらず、
+      // 必ず unloadRole で UNLOAD が実行される。
+      redshiftUnloadIamRoleArn: redshiftUnloadRole.roleArn,
+      downloadPresignTtlSeconds: props.csvDownloadPresignTtlSeconds ?? 3600,
     });
 
     // ========================================
@@ -109,6 +140,9 @@ export class DwhAgentStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, 'CsvBucketName', {
       value: csvStorage.bucket.bucketName,
+    });
+    new cdk.CfnOutput(this, 'CsvDownloadBucketName', {
+      value: csvDownloadStorage.bucket.bucketName,
     });
     new cdk.CfnOutput(this, 'ConfigTableName', {
       value: database.configTable.tableName,

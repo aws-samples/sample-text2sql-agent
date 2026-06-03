@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
-import { Box, TextField, IconButton, Paper, Typography, CircularProgress, Tooltip, Chip } from '@mui/material';
+import { Box, TextField, IconButton, Paper, Typography, CircularProgress, Tooltip, Chip, Button } from '@mui/material';
 import SendIcon from '@mui/icons-material/Send';
+import DownloadIcon from '@mui/icons-material/Download';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { streamChat } from '../api';
@@ -14,11 +15,24 @@ interface ToolUseEntry {
   skillName?: string;
 }
 
+type CsvStatus = 'ready' | 'expired' | 'not_found' | 'objects_missing' | 'failed' | 'error' | 'pending';
+
+interface CsvAttachment {
+  file_id: string;
+  url?: string;
+  filename: string;
+  expires_at?: number;
+  status: CsvStatus;
+  description?: string;
+  errorMessage?: string;
+}
+
 interface Message {
   role: string;
   content: string;
   toolUses?: ToolUseEntry[];
   charts?: ChartSpec[];
+  csvFiles?: CsvAttachment[];
 }
 
 interface Props {
@@ -27,6 +41,25 @@ interface Props {
   initialMessages: Message[];
   onSessionCreated: (id: string) => void;
   onStreamComplete?: (sessionId?: string) => void;
+}
+
+function csvStatusLabel(att: CsvAttachment): string {
+  switch (att.status) {
+    case 'expired':
+      return `${att.filename || 'CSV'} (リンク失効)`;
+    case 'not_found':
+      return `${att.filename || 'CSV'} (ファイルが見つかりません)`;
+    case 'objects_missing':
+      return `${att.filename || 'CSV'} (S3 上のファイルが削除されています)`;
+    case 'failed':
+      return `CSV 作成失敗${att.errorMessage ? `: ${att.errorMessage}` : ''}`;
+    case 'error':
+      return `CSV 取得エラー${att.errorMessage ? `: ${att.errorMessage}` : ''}`;
+    case 'pending':
+      return `${att.filename || 'CSV'} (生成中)`;
+    default:
+      return att.filename || 'CSV';
+  }
 }
 
 export default function ChatInterface({ agentId, sessionId, initialMessages, onSessionCreated, onStreamComplete }: Props) {
@@ -47,6 +80,7 @@ export default function ChatInterface({ agentId, sessionId, initialMessages, onS
       if (msg.role !== 'assistant' || !msg.tool_uses?.length) return msg;
       const toolUses: ToolUseEntry[] = [];
       const charts: ChartSpec[] = [];
+      const csvFiles: CsvAttachment[] = [];
       for (const t of msg.tool_uses) {
         if (t.tool === '_redshift_query') {
           let sql = '';
@@ -55,22 +89,39 @@ export default function ChatInterface({ agentId, sessionId, initialMessages, onS
             const parsed = JSON.parse(t.input ?? '{}');
             sql = parsed.sql_query ?? '';
             description = parsed.description ?? '';
-          } catch { /* ignore */ }
+          } catch (err) { console.error('[ChatInterface] _redshift_query input parse failed', err); }
           toolUses.push({ tool: t.tool, sql, description });
         } else if (t.tool === '_render_chart' && t.chart_spec) {
           charts.push(t.chart_spec as ChartSpec);
+        } else if (t.tool === '_create_csv_file') {
+          // バックエンドが付加した csv_status を元に CsvAttachment を構築
+          const status: CsvStatus = (t.csv_status as CsvStatus) ?? 'pending';
+          csvFiles.push({
+            file_id: t.file_id ?? '',
+            url: t.url,
+            filename: t.filename ?? '',
+            expires_at: t.expires_at,
+            status,
+            description: t.description ?? '',
+            errorMessage: t.error_message,
+          });
         } else if (t.tool === 'skills') {
           let skillName = '';
           try {
             const parsed = JSON.parse(t.input ?? '{}');
             skillName = parsed.skill_name ?? '';
-          } catch { /* ignore */ }
+          } catch (err) { console.error('[ChatInterface] skills input parse failed', err); }
           toolUses.push({ tool: t.tool, skillName });
         } else {
           toolUses.push({ tool: t.tool });
         }
       }
-      return { ...msg, toolUses, ...(charts.length > 0 ? { charts } : {}) };
+      return {
+        ...msg,
+        toolUses,
+        ...(charts.length > 0 ? { charts } : {}),
+        ...(csvFiles.length > 0 ? { csvFiles } : {}),
+      };
     });
     setMessages(mapped);
   }, [initialMessages]);
@@ -90,18 +141,29 @@ export default function ChatInterface({ agentId, sessionId, initialMessages, onS
     let assistantContent = '';
     let toolUses: ToolUseEntry[] = [];
     let charts: ChartSpec[] = [];
-    setMessages(prev => [...prev, { role: 'assistant', content: '', toolUses: [], charts: [] }]);
+    let csvFiles: CsvAttachment[] = [];
+    setMessages(prev => [...prev, { role: 'assistant', content: '', toolUses: [], charts: [], csvFiles: [] }]);
+
+    const updateLast = () => {
+      setMessages(prev => {
+        const updated = [...prev];
+        updated[updated.length - 1] = {
+          role: 'assistant',
+          content: assistantContent,
+          toolUses: [...toolUses],
+          charts: [...charts],
+          csvFiles: [...csvFiles],
+        };
+        return updated;
+      });
+    };
 
     try {
       await streamChat(sid, userMsg, agentId, {
         onToken: (chunk) => {
           if (!mountedRef.current) return;
           assistantContent += chunk;
-          setMessages(prev => {
-            const updated = [...prev];
-            updated[updated.length - 1] = { role: 'assistant', content: assistantContent, toolUses: [...toolUses], charts: [...charts] };
-            return updated;
-          });
+          updateLast();
         },
         onToolUse: (tool, input) => {
           if (!mountedRef.current) return;
@@ -112,35 +174,47 @@ export default function ChatInterface({ agentId, sessionId, initialMessages, onS
               const parsed = JSON.parse(input ?? '{}');
               sql = parsed.sql_query ?? '';
               description = parsed.description ?? '';
-            } catch { /* ignore */ }
+            } catch (err) { console.error('[ChatInterface] _redshift_query input parse failed', err); }
             toolUses = [...toolUses, { tool, sql, description }];
           } else if (tool === 'skills') {
             let skillName = '';
             try {
               const parsed = JSON.parse(input ?? '{}');
               skillName = parsed.skill_name ?? '';
-            } catch { /* ignore */ }
+            } catch (err) { console.error('[ChatInterface] skills input parse failed', err); }
             toolUses = [...toolUses, { tool, skillName }];
           } else if (tool === '_render_chart') {
             toolUses = [...toolUses, { tool }];
+          } else if (tool === '_create_csv_file') {
+            // 生成中チップを表示しておく (csv_url SSE が来たら ready に上書き)
+            let description = '';
+            try {
+              const parsed = JSON.parse(input ?? '{}');
+              description = parsed.description ?? '';
+            } catch (err) { console.error('[ChatInterface] _create_csv_file input parse failed', err); }
+            toolUses = [...toolUses, { tool, description }];
           } else {
             assistantContent += `\n\n🔧 *${tool}*\n\n`;
             toolUses = [...toolUses, { tool }];
           }
-          setMessages(prev => {
-            const updated = [...prev];
-            updated[updated.length - 1] = { role: 'assistant', content: assistantContent, toolUses: [...toolUses], charts: [...charts] };
-            return updated;
-          });
+          updateLast();
         },
         onChart: (spec) => {
           if (!mountedRef.current) return;
           charts = [...charts, spec];
-          setMessages(prev => {
-            const updated = [...prev];
-            updated[updated.length - 1] = { role: 'assistant', content: assistantContent, toolUses: [...toolUses], charts: [...charts] };
-            return updated;
-          });
+          updateLast();
+        },
+        onCsvUrl: (csv) => {
+          if (!mountedRef.current) return;
+          csvFiles = [...csvFiles, {
+            file_id: csv.file_id,
+            url: csv.url,
+            filename: csv.filename,
+            expires_at: csv.expires_at,
+            status: 'ready',
+            description: csv.description,
+          }];
+          updateLast();
         },
         onError: (err) => {
           if (!mountedRef.current) return;
@@ -188,6 +262,30 @@ export default function ChatInterface({ agentId, sessionId, initialMessages, onS
                   ))}
                   {msg.charts?.map((spec, j) => (
                     <ChartRenderer key={`chart-${j}`} spec={spec} />
+                  ))}
+                  {msg.csvFiles?.map((csv, j) => (
+                    csv.status === 'ready' && csv.url ? (
+                      <Button
+                        key={`csv-${j}`}
+                        variant="contained"
+                        size="small"
+                        href={csv.url}
+                        download={csv.filename}
+                        startIcon={<DownloadIcon />}
+                        sx={{ mb: 0.5, display: 'flex', width: 'fit-content', textTransform: 'none' }}
+                      >
+                        {csv.filename} をダウンロード
+                      </Button>
+                    ) : (
+                      <Tooltip key={`csv-${j}`} title={csv.description || ''} placement="top" arrow>
+                        <Chip
+                          label={csvStatusLabel(csv)}
+                          size="small"
+                          color="warning"
+                          sx={{ mb: 0.5, display: 'flex', width: 'fit-content' }}
+                        />
+                      </Tooltip>
+                    )
                   ))}
                   {msg.content
                     ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>

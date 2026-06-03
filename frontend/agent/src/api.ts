@@ -37,6 +37,24 @@ export async function deleteSession(sessionId: string) {
   return res.json();
 }
 
+/**
+ * 失効した CSV ダウンロードリンクを再発行する。
+ *  - 404: ファイルが存在しない (not_found)
+ *  - 410: 失効済み (expired) または S3 から消えた (objects_missing)
+ */
+export async function refreshCsvUrl(fileId: string): Promise<CsvUrl> {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_ENDPOINT}csv/${encodeURIComponent(fileId)}`, { headers });
+  if (!res.ok) throw new Error(`Failed to refresh CSV URL: ${res.status}`);
+  const data = await res.json();
+  return {
+    file_id: fileId,
+    url: data.url,
+    filename: data.filename,
+    expires_at: data.expires_at,
+  };
+}
+
 export interface ChartSpec {
   type: 'bar' | 'line' | 'pie';
   title?: string;
@@ -45,10 +63,19 @@ export interface ChartSpec {
   data: Record<string, unknown>[];
 }
 
+export interface CsvUrl {
+  file_id: string;
+  url: string;
+  filename: string;
+  expires_at: number;
+  description?: string;
+}
+
 export interface ChatCallbacks {
   onToken: (content: string) => void;
   onToolUse: (tool: string, input?: string) => void;
   onChart: (spec: ChartSpec) => void;
+  onCsvUrl: (csv: CsvUrl) => void;
   onError: (error: string) => void;
   onDone: () => void;
 }
@@ -83,9 +110,13 @@ export async function streamChat(sessionId: string, message: string, agentId: st
         if (data.type === 'token') callbacks.onToken(data.content);
         else if (data.type === 'tool_use') callbacks.onToolUse(data.tool, data.input);
         else if (data.type === 'chart') callbacks.onChart(data.spec);
+        else if (data.type === 'csv_url') callbacks.onCsvUrl(data as CsvUrl);
         else if (data.type === 'error') callbacks.onError(data.content);
         else if (data.type === 'done') callbacks.onDone();
-      } catch { /* ignore parse errors */ }
+      } catch (err) {
+        // No Silent Fallbacks: パース失敗は痕跡を残す
+        console.error('[streamChat] failed to parse SSE data:', line.slice(0, 200), err);
+      }
     }
   }
 }

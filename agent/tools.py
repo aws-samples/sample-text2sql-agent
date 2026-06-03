@@ -1,11 +1,14 @@
 """
-Strands Agents カスタムツール: Redshift Data API + チャート描画
+Strands Agents カスタムツール: Redshift Data API + チャート描画 + CSV ダウンロード
 """
 import json
 import logging
 import os
+import re
 import time
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import boto3
@@ -14,6 +17,8 @@ from strands import tool
 logger = logging.getLogger(__name__)
 
 redshift_data = boto3.client("redshift-data", region_name=os.environ.get("AWS_REGION"))
+s3_client = boto3.client("s3", region_name=os.environ.get("AWS_REGION"))
+dynamodb_resource = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION"))
 
 SQL_RESULT_THRESHOLD = int(os.environ.get("SQL_RESULT_THRESHOLD", "200"))
 
@@ -23,9 +28,10 @@ SQL_RESULT_THRESHOLD = int(os.environ.get("SQL_RESULT_THRESHOLD", "200"))
 # ---------------------------------------------------------------------------
 @dataclass
 class ToolSharedState:
-    """agent.py の invoke() にチャート仕様を受け渡すための状態"""
+    """agent.py の invoke() にチャート / CSV ダウンロード情報を受け渡すための状態"""
 
     _pending_chart_specs: list[dict] = field(default_factory=list)
+    _pending_csv_files: list[dict] = field(default_factory=list)
 
     def add_chart_spec(self, spec: dict) -> None:
         self._pending_chart_specs.append(spec)
@@ -36,16 +42,111 @@ class ToolSharedState:
         self._pending_chart_specs.clear()
         return specs
 
+    def add_csv_file(self, info: dict) -> None:
+        self._pending_csv_files.append(info)
+
+    def pop_csv_files(self) -> list[dict]:
+        """保留中の CSV ダウンロード情報をすべて取り出す（取り出し後クリア）"""
+        files = list(self._pending_csv_files)
+        self._pending_csv_files.clear()
+        return files
+
+
+# ---------------------------------------------------------------------------
+# UNLOAD 用 SQL バリデーション / 加工
+# ---------------------------------------------------------------------------
+def _validate_sql_for_unload(sql_query: str) -> None:
+    """UNLOAD への注入と複文実行を防ぐためのバリデーション
+
+    対策:
+      1. 複文実行 (`;` の後に文字が続く) を拒否
+      2. UNLOAD キーワード自体を拒否 (UNLOAD 注入対策)
+
+    コメントは事前に除去してから判定するため、`-- ; DROP ...` のような
+    コメント経由の複文も検出できる。
+    """
+    normalized = sql_query.upper().strip()
+
+    # コメント除去
+    normalized = re.sub(r"--.*$", "", normalized, flags=re.MULTILINE)
+    normalized = re.sub(r"/\*.*?\*/", "", normalized, flags=re.DOTALL)
+
+    # 複文 (`;` 後に非空白文字)
+    if re.search(r";\s*\S", normalized):
+        raise ValueError("Multiple SQL statements are not allowed")
+
+    # UNLOAD 注入 (テーブル名等に UNLOAD_X が含まれていても false positive にならないよう \b で囲む)
+    if re.search(r"\bUNLOAD\b", normalized):
+        raise ValueError("UNLOAD statements are not allowed in user queries")
+
+
+def _prepare_query_for_unload(sql_query: str) -> str:
+    """UNLOAD ('...') 内に埋め込めるように SQL を加工する
+
+    1. バリデーション
+    2. トレイリングセミコロン除去
+    3. LIMIT 等のクエリ末尾制約を回避するためサブクエリでラップ
+    4. シングルクォートをエスケープ (UNLOAD 文字列リテラルの破壊防止)
+    """
+    _validate_sql_for_unload(sql_query)
+
+    clean = sql_query.strip().rstrip(";")
+    wrapped = f"SELECT * FROM ({clean}) subq"
+    escaped = wrapped.replace("'", "''")
+    return escaped
+
+
+def _format_iam_role_clause(role_value: str) -> str:
+    """UNLOAD ... IAM_ROLE 句に埋め込む文字列を整形する。
+
+    - "default" の場合 → そのまま `IAM_ROLE default`
+    - ARN (arn:aws:iam::...) の場合 → `IAM_ROLE 'arn:aws:iam::...'` (要シングルクォート)
+
+    ARN 文字列に `'` が含まれる事は無いが、念のため不正値はバリデーションで弾く。
+    """
+    role_value = role_value.strip()
+    if role_value == "default":
+        return "IAM_ROLE default"
+    if not role_value.startswith("arn:"):
+        # No Silent Fallback: 想定外の値が来たら raise する。
+        # (default でもなく ARN 形式でもない値はそもそも UNLOAD で受理されない)
+        raise ValueError(f"Invalid IAM role value for UNLOAD: {role_value!r}")
+    if "'" in role_value or "\n" in role_value:
+        raise ValueError(f"Invalid characters in IAM role ARN: {role_value!r}")
+    return f"IAM_ROLE '{role_value}'"
+
 
 # ---------------------------------------------------------------------------
 # ツールファクトリ
 # ---------------------------------------------------------------------------
 def create_tools(
-    workgroup_name: str, database: str, secret_arn: str,
+    workgroup_name: str,
+    database: str,
+    secret_arn: str,
+    user_id: str,
+    download_bucket: str,
+    files_table_name: str,
+    presign_ttl_seconds: int,
+    redshift_unload_iam_role: str,
 ) -> tuple[list, ToolSharedState]:
-    """全ツールと共有状態を生成して返す"""
+    """全ツールと共有状態を生成して返す
+
+    Args:
+        workgroup_name: Redshift Workgroup 名
+        database: Redshift データベース名
+        secret_arn: agent_readonly 接続情報の Secrets Manager ARN
+        user_id: 実行ユーザーの Cognito sub。CSV ファイルの所有者として使う
+        download_bucket: CSV ダウンロード用 S3 バケット
+        files_table_name: ファイルメタデータを保存する DynamoDB テーブル名
+        presign_ttl_seconds: presigned URL の有効期限秒
+        redshift_unload_iam_role: UNLOAD ... IAM_ROLE に渡す値 ("default" または ARN)
+    """
 
     state = ToolSharedState()
+    files_table = dynamodb_resource.Table(files_table_name)
+
+    # IAM_ROLE 句は SQL 組み立て前に整形・検証する (毎回再生成する必要はない)
+    iam_role_clause = _format_iam_role_clause(redshift_unload_iam_role)
 
     @tool
     def _redshift_query(sql_query: str, description: str) -> str:
@@ -174,7 +275,118 @@ def create_tools(
             raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
         return json.dumps({"status": "ok", "chart_spec": chart_spec}, ensure_ascii=False, default=_decimal_serializer)
 
-    return [_redshift_query, _render_chart], state
+    @tool
+    def _create_csv_file(sql_query: str, description: str) -> str:
+        """SQL の結果を CSV ファイル (gzip 圧縮) として S3 に書き出し、ユーザーがダウンロードできるようにする。
+
+        使用するタイミング:
+          - クエリ結果が _redshift_query の閾値を超えた、または超える見込みの場合
+          - ユーザーが明示的に CSV ダウンロードを要求した場合
+        呼び出し後はユーザーに「ダウンロードリンクを生成しました」と伝えるだけでよい。
+        URL や file_id は LLM への戻り値に含まれないので言及しないこと。
+
+        Args:
+            sql_query: 結果を CSV 化したい SELECT 文
+            description: 何のためのファイルかをユーザー向けに簡潔に表す説明。例: "2024年の月別売上データ", "全顧客リスト"
+        """
+        t0 = time.time()
+        try:
+            # 1. バリデーション + UNLOAD 用に整形
+            prepared = _prepare_query_for_unload(sql_query)
+
+            # 2. UNLOAD 実行
+            file_id = str(uuid.uuid4())
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+            s3_prefix = f"csv/{user_id}/{file_id}/{timestamp}"
+            s3_path = f"s3://{download_bucket}/{s3_prefix}/"
+            filename = f"query_results_{timestamp}.csv.gz"
+
+            unload_sql = (
+                f"UNLOAD ('{prepared}')\n"
+                f"TO '{s3_path}'\n"
+                f"{iam_role_clause}\n"
+                f"CSV HEADER GZIP ALLOWOVERWRITE PARALLEL OFF"
+            )
+            logger.info("[_create_csv_file] UNLOAD start: file_id=%s prefix=%s", file_id, s3_prefix)
+
+            response = redshift_data.execute_statement(
+                WorkgroupName=workgroup_name,
+                Database=database,
+                SecretArn=secret_arn,
+                Sql=unload_sql,
+            )
+            statement_id = response["Id"]
+
+            status = _wait_for_completion(statement_id)
+            if status != "FINISHED":
+                desc = redshift_data.describe_statement(Id=statement_id)
+                error = desc.get("Error", "Unknown error")
+                # No Silent Fallback: 失敗は LLM に明示的に返す (raise はせず文字列で返す)
+                logger.error("[_create_csv_file] UNLOAD failed: status=%s error=%s", status, error)
+                return f"CSV ファイル作成失敗 (status={status}): {error}"
+
+            # 3. UNLOAD で書かれたオブジェクトを確認 (空でも 1 ファイルは出る前提)
+            objects = s3_client.list_objects_v2(Bucket=download_bucket, Prefix=s3_prefix)
+            contents = objects.get("Contents") or []
+            if not contents:
+                logger.error("[_create_csv_file] UNLOAD wrote no files: prefix=%s", s3_prefix)
+                return "CSV ファイル作成失敗: UNLOAD はファイルを書き出しませんでした。"
+
+            # 4. メタデータ保存 (ユーザー越境防止のため (user_id, file_id) 複合キー)
+            expires_at = int(time.time()) + presign_ttl_seconds
+            files_table.put_item(Item={
+                "user_id": user_id,
+                "file_id": file_id,
+                "s3_prefix": s3_prefix,
+                "filename": filename,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "expires_at": expires_at,
+                # 監査用に元 SQL の冒頭を残す
+                "sql_query": sql_query[:500],
+            })
+
+            # 5. presigned URL を発行 (ストリーミングで返すため Runtime 内で生成)
+            key = contents[0]["Key"]
+            url = s3_client.generate_presigned_url(
+                "get_object",
+                Params={
+                    "Bucket": download_bucket,
+                    "Key": key,
+                    "ResponseContentDisposition": f'attachment; filename="{filename}"',
+                },
+                ExpiresIn=presign_ttl_seconds,
+            )
+
+            # 6. SSE 用に共有状態へ登録 (LLM の戻り値には URL を含めない)
+            state.add_csv_file({
+                "file_id": file_id,
+                "filename": filename,
+                "url": url,
+                "expires_at": expires_at,
+                "description": description,
+            })
+
+            logger.info(
+                "[_create_csv_file] success: file_id=%s rows=? key=%s",
+                file_id, key,
+            )
+
+            # 7. LLM への戻り値は短い確認文字列のみ (URL は隠す)
+            #    Lambda プロキシの _strands_to_display_messages がこの戻り値から file_id を抽出し
+            #    セッション復元時に presigned URL を再発行する。
+            return f"CSV file created. file_id={file_id}"
+
+        except ValueError as e:
+            # バリデーション失敗 (UNLOAD 注入 / 複文等)
+            logger.warning("[_create_csv_file] validation failed: %s", e)
+            return f"CSV ファイル作成失敗: {str(e)}"
+        except Exception as e:
+            logger.exception("[_create_csv_file] unexpected error: %s", e)
+            return f"CSV ファイル作成エラー: {str(e)}"
+        finally:
+            logger.info("[_create_csv_file] elapsed=%.2fs", time.time() - t0)
+
+    return [_redshift_query, _render_chart, _create_csv_file], state
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +468,8 @@ def _format_result(sql_query: str, result: dict) -> str:
     if truncated:
         lines.append(
             f"\n注意: クエリ結果は全{total}件ですが、先頭{SQL_RESULT_THRESHOLD}件のみ返しています。"
-            "全件が必要な場合はユーザーに必ず確認したうえで、WHERE句やLIMIT句で結果を絞り込んだり、GROUP BYして集計してください。"
+            "全件が必要な場合はユーザーに必ず確認したうえで、_create_csv_file ツールを使って CSV ダウンロードリンクを提供するか、"
+            "WHERE句やLIMIT句で結果を絞り込んだり、GROUP BYして集計してください。"
         )
 
     return "\n".join(lines)

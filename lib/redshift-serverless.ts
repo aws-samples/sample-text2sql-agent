@@ -8,6 +8,8 @@ import { Construct } from 'constructs';
 export interface RedshiftServerlessProps {
   /** Admin用 IAM Role (COPY コマンドで S3 からデータロード) */
   adminRole: iam.IRole;
+  /** UNLOAD 用 IAM Role (Agent の _create_csv_file が CSV ダウンロードバケットへ書き出す) */
+  unloadRole: iam.IRole;
 }
 
 
@@ -82,13 +84,17 @@ export class RedshiftServerless extends Construct {
     });
 
     // Namespace
+    // - iamRoles: 使える Role を全て登録 (adminRole は COPY 用、unloadRole は UNLOAD 用)
+    // - defaultIamRoleArn: 最小権限である unloadRole を default に設定
+    //   ただし本プロジェクトでは COPY も UNLOAD も SQL 側で `IAM_ROLE 'arn:...'` を
+    //   明示するため、IAM_ROLE default に依存するパスは無い
     this.namespace = new redshiftserverless.CfnNamespace(this, 'Namespace', {
       namespaceName: this.namespaceName,
       dbName: this.dbName,
       adminUsername: 'admin',
       adminUserPassword: this.adminSecret.secretValueFromJson('password').unsafeUnwrap(),
-      iamRoles: [props.adminRole.roleArn],
-      defaultIamRoleArn: props.adminRole.roleArn,
+      iamRoles: [props.adminRole.roleArn, props.unloadRole.roleArn],
+      defaultIamRoleArn: props.unloadRole.roleArn,
     });
 
     // Workgroup (Data API 経由のみ接続するため publiclyAccessible: false)
