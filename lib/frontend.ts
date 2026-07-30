@@ -73,6 +73,7 @@ export class Frontend extends Construct {
       ],
       destinationBucket: webBucket,
       distribution: this.distribution,
+      nodejsVersion: 22,
       outputSourceDirectory: 'dist',
       buildCommands: ['npm ci', 'npm run build'],
       buildEnvironment: props.buildEnvironments,
