@@ -180,7 +180,7 @@ def create_tools(
                 return f"クエリ失敗 (status={status}): {error}"
 
             result = _fetch_result(statement_id)
-            formatted = _format_result(sql_query, result)
+            formatted = _format_result(sql_query, result, csv_download_enabled=enable_csv_download)
             return formatted
 
         except Exception as e:
@@ -453,7 +453,7 @@ def _extract_field_value(field: dict):
     return None
 
 
-def _format_result(sql_query: str, result: dict) -> str:
+def _format_result(sql_query: str, result: dict, csv_download_enabled: bool = True) -> str:
     """Redshift Data API の結果をテキストにフォーマット"""
     columns = [col["name"] for col in result["ColumnMetadata"]]
     records = result["Records"]
@@ -474,10 +474,18 @@ def _format_result(sql_query: str, result: dict) -> str:
         lines.append(" | ".join(row_values))
 
     if truncated:
-        lines.append(
-            f"\n注意: クエリ結果は全{total}件ですが、先頭{SQL_RESULT_THRESHOLD}件のみ返しています。"
-            "全件が必要な場合はユーザーに必ず確認したうえで、_create_csv_file ツールを使って CSV ダウンロードリンクを提供するか、"
-            "WHERE句やLIMIT句で結果を絞り込んだり、GROUP BYして集計してください。"
-        )
+        if csv_download_enabled:
+            lines.append(
+                f"\n注意: クエリ結果は全{total}件ですが、先頭{SQL_RESULT_THRESHOLD}件のみ返しています。"
+                "全件が必要な場合はユーザーに必ず確認したうえで、_create_csv_file ツールを使って CSV ダウンロードリンクを提供するか、"
+                "WHERE句やLIMIT句で結果を絞り込んだり、GROUP BYして集計してください。"
+            )
+        else:
+            # CSV ダウンロード機能が無効な構成では CSV エクスポートに言及しない
+            lines.append(
+                f"\n注意: クエリ結果は全{total}件ですが、先頭{SQL_RESULT_THRESHOLD}件のみ返しています。"
+                "この環境では CSV エクスポート機能は提供されていないため、ユーザーに CSV エクスポートを提案しないでください。"
+                "WHERE句やLIMIT句で結果を絞り込んだり、GROUP BYして集計することを提案してください。"
+            )
 
     return "\n".join(lines)
