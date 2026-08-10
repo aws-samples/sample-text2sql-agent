@@ -25,8 +25,16 @@ logger = logging.getLogger(__name__)
 ALLOW_ORIGIN = os.environ["ALLOW_ORIGIN"]
 CONFIG_TABLE_NAME = os.environ["CONFIG_TABLE_NAME"]
 BEDROCK_MODEL_ID = os.environ["BEDROCK_MODEL_ID"]
-CSV_BUCKET_NAME = os.environ["CSV_BUCKET_NAME"]
-INIT_WORKFLOW_STATE_MACHINE_ARN = os.environ["INIT_WORKFLOW_STATE_MACHINE_ARN"]
+
+# CSV アップロード機能 (Upload & Build)。existingRedshift モードでは未設定
+CSV_BUCKET_NAME = os.environ.get("CSV_BUCKET_NAME", "")
+INIT_WORKFLOW_STATE_MACHINE_ARN = os.environ.get("INIT_WORKFLOW_STATE_MACHINE_ARN", "")
+
+# existingRedshift モード (既存テーブルからのスキーマ自動生成)。通常モードでは未設定
+EXISTING_REDSHIFT_MODE = os.environ.get("EXISTING_REDSHIFT_MODE", "false").lower() == "true"
+REDSHIFT_WORKGROUP_NAME = os.environ.get("REDSHIFT_WORKGROUP_NAME", "")
+REDSHIFT_DATABASE = os.environ.get("REDSHIFT_DATABASE", "")
+REDSHIFT_SECRET_ARN = os.environ.get("REDSHIFT_SECRET_ARN", "")
 
 dynamodb = boto3.resource("dynamodb")
 config_table = dynamodb.Table(CONFIG_TABLE_NAME)
@@ -61,6 +69,24 @@ def get_user_id_from_request(request: Request) -> str:
         except (json.JSONDecodeError, AttributeError):
             pass
     raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _require_csv_upload_enabled() -> None:
+    """CSV アップロード機能 (Upload & Build) が有効な構成であることを要求する"""
+    if not CSV_BUCKET_NAME or not INIT_WORKFLOW_STATE_MACHINE_ARN:
+        raise HTTPException(
+            status_code=400,
+            detail="CSV アップロード機能はこの構成 (existingRedshift モード) では無効です",
+        )
+
+
+def _require_existing_redshift_mode() -> None:
+    """existingRedshift モード (既存テーブル参照) であることを要求する"""
+    if not EXISTING_REDSHIFT_MODE:
+        raise HTTPException(
+            status_code=400,
+            detail="このエンドポイントは existingRedshift モードでのみ利用できます",
+        )
 
 
 @app.get("/")
@@ -180,6 +206,7 @@ class PresignedUrlsRequest(BaseModel):
 @app.post("/admin/presigned-urls")
 async def presigned_urls(request: Request, body: PresignedUrlsRequest):
     get_user_id_from_request(request)
+    _require_csv_upload_enabled()
     logger.info("POST /admin/presigned-urls: filenames=%s", body.filenames)
 
     prefix = f"uploads/{datetime.now().strftime('%Y%m%d%H%M%S')}/"
@@ -210,6 +237,7 @@ class ListCsvRequest(BaseModel):
 @app.post("/admin/list-csv")
 async def list_csv(request: Request, body: ListCsvRequest):
     get_user_id_from_request(request)
+    _require_csv_upload_enabled()
     prefix = body.prefix.lstrip("/")
     logger.info("POST /admin/list-csv: prefix=%s", prefix)
 
@@ -766,6 +794,7 @@ class AnalyzeRequest(BaseModel):
 @app.post("/admin/analyze")
 async def analyze(request: Request, body: AnalyzeRequest):
     get_user_id_from_request(request)
+    _require_csv_upload_enabled()
     prefix = body.prefix.lstrip("/")
     logger.info("POST /admin/analyze: prefix=%s", prefix)
 
@@ -944,6 +973,7 @@ class ApplyRequest(BaseModel):
 @app.post("/admin/apply")
 async def apply(request: Request, body: ApplyRequest):
     get_user_id_from_request(request)
+    _require_csv_upload_enabled()
     prefix = body.prefix.lstrip("/")
     logger.info("POST /admin/apply: prefix=%s, tables=%d",
                 prefix, len(body.db_schema.get("tables", [])))
@@ -978,6 +1008,7 @@ class ApplyStatusRequest(BaseModel):
 @app.post("/admin/apply-status")
 async def apply_status(request: Request, body: ApplyStatusRequest):
     get_user_id_from_request(request)
+    _require_csv_upload_enabled()
 
     # ステートマシン ARN + 実行 ID から完全な execution_arn を再構築
     execution_arn = f"{INIT_WORKFLOW_STATE_MACHINE_ARN.replace(':stateMachine:', ':execution:')}:{body.execution_id}"
@@ -1100,3 +1131,398 @@ async def update_system_prompt(request: Request, body: SystemPromptUpdateRequest
         ExpressionAttributeValues={":sp": body.system_prompt, ":ua": now},
     )
     return JSONResponse(content={"status": "updated"})
+
+
+# ---------------------------------------------------------------------------
+# existingRedshift モード: 既存テーブルからのスキーマ自動生成
+# ---------------------------------------------------------------------------
+redshift_data = boto3.client("redshift-data")
+
+# システムスキーマは列挙対象から除外する
+_REDSHIFT_SYSTEM_SCHEMAS = (
+    "pg_catalog", "pg_internal", "information_schema", "catalog_history",
+)
+
+
+def _execute_redshift_sql(sql: str, max_wait: int = 120) -> tuple[list[str], list[list]]:
+    """Data API で SQL を実行し (カラム名リスト, 行リスト) を返す (同期待ち)。
+
+    読み取り専用ユーザーの Secret で実行するため、SELECT 以外は権限エラーになる。
+    """
+    import time as _time
+
+    resp = redshift_data.execute_statement(
+        WorkgroupName=REDSHIFT_WORKGROUP_NAME,
+        Database=REDSHIFT_DATABASE,
+        SecretArn=REDSHIFT_SECRET_ARN,
+        Sql=sql,
+    )
+    statement_id = resp["Id"]
+    for _ in range(max_wait):
+        desc = redshift_data.describe_statement(Id=statement_id)
+        status = desc["Status"]
+        if status == "FINISHED":
+            break
+        if status in ("FAILED", "ABORTED"):
+            error = desc.get("Error", "Unknown error")
+            raise RuntimeError(f"Redshift query failed ({status}): {error}")
+        _time.sleep(1)
+    else:
+        raise RuntimeError("Redshift query timed out")
+
+    if not desc.get("HasResultSet"):
+        return [], []
+
+    columns: list[str] = []
+    rows: list[list] = []
+    next_token = None
+    while True:
+        kwargs = {"Id": statement_id}
+        if next_token:
+            kwargs["NextToken"] = next_token
+        result = redshift_data.get_statement_result(**kwargs)
+        if not columns:
+            columns = [c["name"] for c in result["ColumnMetadata"]]
+        for record in result.get("Records", []):
+            rows.append([_extract_data_api_value(f) for f in record])
+        next_token = result.get("NextToken")
+        if not next_token:
+            break
+    return columns, rows
+
+
+def _extract_data_api_value(field: dict):
+    """Data API のフィールドから型を保持した値を取り出す"""
+    if field.get("isNull"):
+        return None
+    for key in ("stringValue", "longValue", "doubleValue", "booleanValue"):
+        if key in field:
+            return field[key]
+    return None
+
+
+def _quote_ident(ident: str) -> str:
+    """Redshift 識別子をダブルクォートで安全に囲む"""
+    return '"' + ident.replace('"', '""') + '"'
+
+
+def _list_redshift_tables() -> list[dict]:
+    """読み取り専用ユーザーから見える既存テーブル / ビューを列挙する"""
+    system_schemas = ", ".join(f"'{s}'" for s in _REDSHIFT_SYSTEM_SCHEMAS)
+    sql = (
+        "SELECT table_schema, table_name, table_type "
+        "FROM information_schema.tables "
+        f"WHERE table_schema NOT IN ({system_schemas}) "
+        # standard_conforming_strings が ON のため SQL 側は 'pg\_%' (LIKE の _ をエスケープ)
+        "AND table_schema NOT LIKE 'pg\\_%' "
+        "ORDER BY table_schema, table_name"
+    )
+    _, rows = _execute_redshift_sql(sql)
+    return [
+        {"schema": r[0], "name": r[1], "type": "VIEW" if r[2] == "VIEW" else "TABLE"}
+        for r in rows
+    ]
+
+
+def _format_redshift_column_type(
+    data_type: str,
+    char_max_len,
+    numeric_precision,
+    numeric_scale,
+) -> str:
+    """information_schema.columns の型情報を DDL 風の型表記に整形する"""
+    dt = (data_type or "").upper()
+    if dt == "CHARACTER VARYING":
+        return f"VARCHAR({char_max_len})" if char_max_len else "VARCHAR"
+    if dt == "CHARACTER":
+        return f"CHAR({char_max_len})" if char_max_len else "CHAR"
+    if dt == "NUMERIC":
+        if numeric_precision is not None and numeric_scale is not None:
+            return f"DECIMAL({numeric_precision},{numeric_scale})"
+        return "DECIMAL"
+    if dt == "TIMESTAMP WITHOUT TIME ZONE":
+        return "TIMESTAMP"
+    if dt == "TIMESTAMP WITH TIME ZONE":
+        return "TIMESTAMPTZ"
+    if dt == "TIME WITHOUT TIME ZONE":
+        return "TIME"
+    if dt == "DOUBLE PRECISION":
+        return "DOUBLE PRECISION"
+    return dt
+
+
+def _get_table_columns(schema: str, table: str) -> list[dict]:
+    """テーブルのカラム定義を information_schema.columns から取得する。
+
+    識別子は文字列リテラルとして埋め込むためシングルクォートをエスケープする
+    (対象テーブルは _list_redshift_tables の結果と照合済みだが多層防御)。
+    """
+    schema_lit = schema.replace("'", "''")
+    table_lit = table.replace("'", "''")
+    sql = (
+        "SELECT column_name, data_type, character_maximum_length, "
+        "numeric_precision, numeric_scale "
+        "FROM information_schema.columns "
+        f"WHERE table_schema = '{schema_lit}' AND table_name = '{table_lit}' "
+        "ORDER BY ordinal_position"
+    )
+    _, rows = _execute_redshift_sql(sql)
+    return [
+        {
+            "name": r[0],
+            "type": _format_redshift_column_type(r[1], r[2], r[3], r[4]),
+        }
+        for r in rows
+    ]
+
+
+def _get_sample_rows_text(schema: str, table: str, limit: int = 20) -> str:
+    """サンプル行をテキストテーブルとして取得する (LLM への入力用)"""
+    sql = f"SELECT * FROM {_quote_ident(schema)}.{_quote_ident(table)} LIMIT {limit}"
+    columns, rows = _execute_redshift_sql(sql)
+    if not rows:
+        return "(データなし)"
+    lines = [" | ".join(columns)]
+    for row in rows:
+        lines.append(" | ".join("NULL" if v is None else str(v)[:100] for v in row))
+    return "\n".join(lines)
+
+
+EXISTING_TABLE_DESCRIBE_SYSTEM_PROMPT = """あなたはデータベース設計の専門家です。
+既存の Redshift テーブルの定義（カラム名・型）とサンプルデータを分析し、テーブルとカラムの説明を生成してください。
+
+ルール:
+- description は AI エージェントが SQL を組み立てる際のヒントになるよう、具体的に記述する
+- カラムの description は、わかりにくい場合は架空のデータ例を含めてわかりやすく記述する（例：「顧客ID（例：C001234）」）
+- 個人情報は実データから抜き出さず、フォーマットを揃えた架空の例を使用する
+- カラム名と型は与えられたものをそのまま使い、変更しない
+"""
+
+_EXISTING_TABLE_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "description": {"type": "string", "description": "テーブル全体の説明"},
+        "columns": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["name", "description"],
+            },
+        },
+    },
+    "required": ["description", "columns"],
+}
+
+
+def _describe_existing_table_with_bedrock(
+    table_name: str, columns: list[dict], sample_text: str,
+) -> dict:
+    """既存テーブルの説明 (テーブル + カラム) を Bedrock で生成する"""
+    columns_text = "\n".join(f"  - {c['name']} ({c['type']})" for c in columns)
+    user_message = f"""以下の既存 Redshift テーブルの説明を生成してください。
+
+テーブル名: {table_name}
+
+カラム定義:
+{columns_text}
+
+サンプルデータ (先頭20行):
+```
+{sample_text}
+```"""
+
+    tool_config = {
+        "tools": [
+            {
+                "toolSpec": {
+                    "name": "submit_table_description",
+                    "description": "テーブルとカラムの説明を提出する",
+                    "inputSchema": {"json": _EXISTING_TABLE_TOOL_SCHEMA},
+                }
+            }
+        ],
+        "toolChoice": {"tool": {"name": "submit_table_description"}},
+    }
+
+    resp = bedrock_runtime.converse(
+        modelId=BEDROCK_MODEL_ID,
+        system=[{"text": EXISTING_TABLE_DESCRIBE_SYSTEM_PROMPT}],
+        messages=[{"role": "user", "content": [{"text": user_message}]}],
+        toolConfig=tool_config,
+        inferenceConfig={"maxTokens": 8192},
+    )
+
+    tool_block = next(
+        (b for b in resp["output"]["message"]["content"] if "toolUse" in b),
+        None,
+    )
+    if not tool_block:
+        raise RuntimeError(f"AI 分析失敗: {table_name}")
+    return tool_block["toolUse"]["input"]
+
+
+@app.get("/admin/redshift/tables")
+async def list_redshift_tables(request: Request):
+    """既存 Redshift のテーブル一覧を返す (existingRedshift モードのみ)"""
+    get_user_id_from_request(request)
+    _require_existing_redshift_mode()
+    try:
+        tables = _list_redshift_tables()
+    except Exception as e:
+        logger.exception("list_redshift_tables failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"テーブル一覧の取得に失敗しました: {e}")
+    return JSONResponse(content={"tables": tables})
+
+
+class TableRef(BaseModel):
+    schema_name: str
+    table_name: str
+
+
+class GenerateSchemaRequest(BaseModel):
+    tables: list[TableRef]
+
+
+@app.post("/admin/redshift/generate-schema")
+async def generate_schema(request: Request, body: GenerateSchemaRequest):
+    """選択された既存テーブルから db_schema と system_prompt を生成する (SSE)"""
+    get_user_id_from_request(request)
+    _require_existing_redshift_mode()
+
+    if not body.tables:
+        raise HTTPException(status_code=400, detail="テーブルが選択されていません")
+
+    # 実在するテーブルとの照合 (SQL インジェクション対策 + typo 検出)
+    available = {(t["schema"], t["name"]) for t in _list_redshift_tables()}
+    unknown = [
+        f"{t.schema_name}.{t.table_name}"
+        for t in body.tables
+        if (t.schema_name, t.table_name) not in available
+    ]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"存在しない (またはアクセス権のない) テーブルが指定されました: {', '.join(unknown)}",
+        )
+
+    def _sse(event_type: str, data: dict) -> str:
+        return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    async def generate():
+        tables: list[dict] = []
+        errors: list[str] = []
+        total = len(body.tables)
+
+        for idx, ref in enumerate(body.tables, start=1):
+            qualified = f"{ref.schema_name}.{ref.table_name}"
+            yield _sse("progress", {
+                "step": "describe_table", "current": idx, "total": total, "file": qualified,
+            })
+            try:
+                columns = _get_table_columns(ref.schema_name, ref.table_name)
+                if not columns:
+                    errors.append(f"{qualified}: カラム定義を取得できませんでした")
+                    continue
+                sample_text = _get_sample_rows_text(ref.schema_name, ref.table_name)
+                described = _describe_existing_table_with_bedrock(qualified, columns, sample_text)
+
+                # カラム名・型は information_schema の実定義を正とし、LLM は説明のみ担当する
+                desc_by_name = {
+                    c.get("name", ""): c.get("description", "")
+                    for c in described.get("columns", [])
+                }
+                tables.append({
+                    "table_name": qualified,
+                    "description": described.get("description", ""),
+                    "columns": [
+                        {
+                            "name": c["name"],
+                            "type": c["type"],
+                            "description": desc_by_name.get(c["name"], ""),
+                        }
+                        for c in columns
+                    ],
+                })
+                logger.info("generate_schema: [%d/%d] %s 完了", idx, total, qualified)
+            except Exception as e:
+                errors.append(f"{qualified}: {str(e)}")
+                logger.warning("generate_schema: [%d/%d] %s 失敗: %s", idx, total, qualified, e)
+
+        if not tables:
+            detail = "スキーマを生成できませんでした"
+            if errors:
+                detail += f" — {'; '.join(errors)}"
+            yield _sse("error", {"message": detail})
+            return
+
+        # system_prompt 生成 (CSV フローと共通のヘルパーを使用)
+        yield _sse("progress", {"step": "generate_prompt", "current": total, "total": total, "file": ""})
+        try:
+            system_prompt = _generate_system_prompt_with_bedrock(tables)
+        except Exception as e:
+            logger.warning("system_prompt generation failed, using fallback: %s", e)
+            table_names = ", ".join(t["table_name"] for t in tables)
+            system_prompt = f"あなたはデータ分析アシスタントです。以下のテーブルを使って分析してください: {table_names}"
+
+        yield _sse("result", {
+            "system_prompt": system_prompt,
+            "db_schema": {"tables": tables},
+            **({"warnings": errors} if errors else {}),
+        })
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+class ExistingApplyRequest(BaseModel):
+    agent_name: str
+    system_prompt: str
+    db_schema: dict
+    agent_id: str | None = None
+
+
+@app.post("/admin/redshift/apply")
+async def apply_existing_schema(request: Request, body: ExistingApplyRequest):
+    """生成済みスキーマで Agent を作成 / 更新する (existingRedshift モードのみ)。
+
+    CSV フローの apply と異なり Redshift 側には一切書き込まない
+    (テーブルは既存のものをそのまま使う)。DynamoDB config への保存のみ行う。
+    """
+    get_user_id_from_request(request)
+    _require_existing_redshift_mode()
+
+    if not body.db_schema.get("tables"):
+        raise HTTPException(status_code=400, detail="テーブル定義がありません")
+
+    now = datetime.now(timezone.utc).isoformat()
+    agent_id = body.agent_id or str(uuid.uuid4())
+
+    if body.agent_id:
+        resp = config_table.get_item(Key={"id": body.agent_id})
+        if not resp.get("Item"):
+            raise HTTPException(status_code=404, detail="Agent not found")
+        config_table.update_item(
+            Key={"id": body.agent_id},
+            UpdateExpression="SET agent_name = :an, system_prompt = :sp, db_schema = :ds, updated_at = :ua",
+            ExpressionAttributeValues={
+                ":an": body.agent_name,
+                ":sp": body.system_prompt,
+                ":ds": json.dumps(body.db_schema, ensure_ascii=False),
+                ":ua": now,
+            },
+        )
+    else:
+        config_table.put_item(Item={
+            "id": agent_id,
+            "agent_name": body.agent_name,
+            "system_prompt": body.system_prompt,
+            "db_schema": json.dumps(body.db_schema, ensure_ascii=False),
+            "skills": [],
+            "created_at": now,
+            "updated_at": now,
+        })
+
+    return JSONResponse(content={"agent_id": agent_id, "status": "applied"})

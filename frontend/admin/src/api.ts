@@ -230,3 +230,96 @@ export async function updateSystemPrompt(agentId: string, systemPrompt: string) 
   await throwIfNotOk(res);
   return res.json();
 }
+
+// ---------------------------------------------------------------------------
+// existingRedshift mode: 既存テーブルからのスキーマ自動生成
+// ---------------------------------------------------------------------------
+export interface RedshiftTable {
+  schema: string;
+  name: string;
+  type: 'TABLE' | 'VIEW';
+}
+
+export async function listRedshiftTables(): Promise<{ tables: RedshiftTable[] }> {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_ENDPOINT}admin/redshift/tables`, { headers });
+  await throwIfNotOk(res);
+  return res.json();
+}
+
+export interface GenerateSchemaProgress {
+  step: 'describe_table' | 'generate_prompt';
+  current: number;
+  total: number;
+  file: string;
+}
+
+export async function generateSchemaFromRedshift(
+  tables: { schema_name: string; table_name: string }[],
+  onProgress?: (progress: GenerateSchemaProgress) => void,
+): Promise<{ system_prompt: string; db_schema: any; warnings?: string[] }> {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_ENDPOINT}admin/redshift/generate-schema`, {
+    method: 'POST', headers, body: JSON.stringify({ tables }),
+  });
+  await throwIfNotOk(res);
+
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error('ReadableStream not supported');
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let result: { system_prompt: string; db_schema: any; warnings?: string[] } | null = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop() ?? '';
+
+    for (const part of parts) {
+      const lines = part.split('\n');
+      let eventType = '';
+      let data = '';
+      for (const line of lines) {
+        if (line.startsWith('event: ')) eventType = line.slice(7);
+        else if (line.startsWith('data: ')) data = line.slice(6);
+      }
+      if (!eventType || !data) continue;
+
+      const parsed = JSON.parse(data);
+      if (eventType === 'progress' && onProgress) {
+        onProgress(parsed as GenerateSchemaProgress);
+      } else if (eventType === 'result') {
+        result = parsed;
+      } else if (eventType === 'error') {
+        throw new Error(parsed.message);
+      }
+    }
+  }
+
+  if (!result) throw new Error('スキーマ生成結果を取得できませんでした');
+  return result;
+}
+
+export async function applyExistingSchema(
+  agentName: string,
+  systemPrompt: string,
+  dbSchema: any,
+  agentId?: string,
+): Promise<{ agent_id: string; status: string }> {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_ENDPOINT}admin/redshift/apply`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      agent_name: agentName,
+      system_prompt: systemPrompt,
+      db_schema: dbSchema,
+      ...(agentId ? { agent_id: agentId } : {}),
+    }),
+  });
+  await throwIfNotOk(res);
+  return res.json();
+}

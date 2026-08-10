@@ -5,20 +5,25 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
 import * as path from 'node:path';
 import { Runtime, AgentRuntimeArtifact } from '@aws-cdk/aws-bedrock-agentcore-alpha';
-import { RedshiftServerless } from './redshift-serverless';
+import { IRedshiftConnection } from './redshift-connection';
 
 export interface AgentCoreRuntimeProps {
   sessionsTable: dynamodb.ITable;
   configTable: dynamodb.ITable;
   filesTable: dynamodb.ITable;
   bedrockModelId: string;
-  redshift: RedshiftServerless;
+  redshift: IRedshiftConnection;
   sqlResultThreshold: number;
   enablePromptCache: boolean;
-  /** CSV ダウンロード用バケット (UNLOAD 出力先 + presigned URL 発行) */
-  downloadBucket: s3.IBucket;
+  /**
+   * CSV ダウンロード用バケット (UNLOAD 出力先 + presigned URL 発行)。
+   * 未指定時は CSV ダウンロード機能 (_create_csv_file ツール) 自体が無効になる
+   * (existingRedshift モードでは UNLOAD 用 IAM Role を既存 Namespace に
+   * 関連付けられないため未指定にする)。
+   */
+  downloadBucket?: s3.IBucket;
   /** UNLOAD ... IAM_ROLE に渡す ARN ("default" の場合は文字列 "default") */
-  redshiftUnloadIamRoleArn: string;
+  redshiftUnloadIamRoleArn?: string;
   /** presigned URL の有効期限秒。FilesTable の expires_at にも同値を使用 */
   downloadPresignTtlSeconds: number;
 }
@@ -35,6 +40,11 @@ export class AgentCoreRuntime extends Construct {
       { file: 'Dockerfile' },
     );
 
+    const enableCsvDownload = props.downloadBucket !== undefined;
+    if (enableCsvDownload && !props.redshiftUnloadIamRoleArn) {
+      throw new Error('downloadBucket 指定時は redshiftUnloadIamRoleArn も必須です');
+    }
+
     // Runtime (ECR, CodeBuild, Execution Role のベース権限は L2 が自動生成)
     this.runtime = new Runtime(this, 'Runtime', {
       agentRuntimeArtifact: artifact,
@@ -49,9 +59,12 @@ export class AgentCoreRuntime extends Construct {
         REDSHIFT_SECRET_ARN: props.redshift.agentSecret.secretArn,
         SQL_RESULT_THRESHOLD: String(props.sqlResultThreshold),
         ENABLE_PROMPT_CACHE: String(props.enablePromptCache),
-        DOWNLOAD_BUCKET_NAME: props.downloadBucket.bucketName,
+        ENABLE_CSV_DOWNLOAD: String(enableCsvDownload),
         DOWNLOAD_PRESIGN_TTL_SECONDS: String(props.downloadPresignTtlSeconds),
-        REDSHIFT_UNLOAD_IAM_ROLE_ARN: props.redshiftUnloadIamRoleArn,
+        ...(enableCsvDownload ? {
+          DOWNLOAD_BUCKET_NAME: props.downloadBucket!.bucketName,
+          REDSHIFT_UNLOAD_IAM_ROLE_ARN: props.redshiftUnloadIamRoleArn!,
+        } : {}),
       },
     });
 
@@ -74,6 +87,8 @@ export class AgentCoreRuntime extends Construct {
     // CSV ダウンロード用バケット
     // - presigned URL を発行するため Read 権限が必要 (list_objects_v2 + GetObject)
     // - UNLOAD は Redshift の adminRole が書くので Runtime 自身の Write は不要
-    props.downloadBucket.grantRead(this.runtime);
+    if (enableCsvDownload) {
+      props.downloadBucket!.grantRead(this.runtime);
+    }
   }
 }

@@ -4,6 +4,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
+import { IRedshiftConnection, grantRedshiftDataApi } from './redshift-connection';
 
 export interface RedshiftServerlessProps {
   /** Admin用 IAM Role (COPY コマンドで S3 からデータロード) */
@@ -21,7 +22,7 @@ export interface RedshiftServerlessProps {
  * デフォルト VPC に依存しないよう、専用 VPC / SecurityGroup / Subnet を
  * 明示的に作成して Workgroup に紐付ける (issue #4)。
  */
-export class RedshiftServerless extends Construct {
+export class RedshiftServerless extends Construct implements IRedshiftConnection {
   readonly namespace: redshiftserverless.CfnNamespace;
   readonly workgroup: redshiftserverless.CfnWorkgroup;
   readonly vpc: ec2.Vpc;
@@ -113,40 +114,9 @@ export class RedshiftServerless extends Construct {
 
   /**
    * Data API 権限を付与する (Secrets Manager 認証用)。
-   *
-   * - ExecuteStatement / BatchExecuteStatement → workgroup ARN でスコープ
-   * - CancelStatement / DescribeStatement / GetStatementResult / ListStatements
-   *   → リソースレベル制限非対応のため Resource: "*"（AWS 公式ドキュメント準拠）
-   * - secretsmanager:GetSecretValue → 指定 Secret のみ
-   *
-   * GetCredentials は Secrets Manager 認証では不要なため付与しない。
+   * 実装は redshift-connection.ts の grantRedshiftDataApi を参照。
    */
   grantDataApi(grantee: iam.IGrantable, secret: secretsmanager.ISecret): void {
-    const workgroupArn = `arn:aws:redshift-serverless:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:workgroup/*`;
-
-    grantee.grantPrincipal.addToPrincipalPolicy(
-      new iam.PolicyStatement({
-        actions: [
-          'redshift-data:ExecuteStatement',
-          'redshift-data:BatchExecuteStatement',
-        ],
-        resources: [workgroupArn],
-      }),
-    );
-
-    grantee.grantPrincipal.addToPrincipalPolicy(
-      new iam.PolicyStatement({
-        actions: [
-          'redshift-data:CancelStatement',
-          'redshift-data:DescribeStatement',
-          'redshift-data:GetStatementResult',
-          'redshift-data:ListStatements',
-        ],
-        resources: ['*'],
-      }),
-    );
-
-    // 指定された Secret のみ読み取り可能
-    secret.grantRead(grantee);
+    grantRedshiftDataApi(this, grantee, secret);
   }
 }

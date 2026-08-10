@@ -26,8 +26,9 @@ SESSIONS_TABLE_NAME = os.environ["SESSIONS_TABLE_NAME"]
 CONFIG_TABLE_NAME = os.environ["CONFIG_TABLE_NAME"]
 FILES_TABLE_NAME = os.environ["FILES_TABLE_NAME"]
 AGENTCORE_RUNTIME_ARN = os.environ["AGENTCORE_RUNTIME_ARN"]
-DOWNLOAD_BUCKET_NAME = os.environ["DOWNLOAD_BUCKET_NAME"]
-DOWNLOAD_PRESIGN_TTL_SECONDS = int(os.environ["DOWNLOAD_PRESIGN_TTL_SECONDS"])
+# CSV ダウンロード機能が無効な構成 (existingRedshift モード) では未設定
+DOWNLOAD_BUCKET_NAME = os.environ.get("DOWNLOAD_BUCKET_NAME", "")
+DOWNLOAD_PRESIGN_TTL_SECONDS = int(os.environ.get("DOWNLOAD_PRESIGN_TTL_SECONDS", "3600"))
 
 dynamodb = boto3.resource("dynamodb")
 sessions_table = dynamodb.Table(SESSIONS_TABLE_NAME)
@@ -87,6 +88,10 @@ def regenerate_presigned_url(user_id: str, file_id: str) -> dict:
 
     No Silent Fallbacks: 「正常な空結果」を返さず、すべて状態フィールドで区別する。
     """
+    if not DOWNLOAD_BUCKET_NAME:
+        # CSV ダウンロード機能が無効な構成ではファイルが存在し得ない
+        return {"status": "not_found"}
+
     resp = files_table.get_item(Key={"user_id": user_id, "file_id": file_id})
     item = resp.get("Item")
     if not item:

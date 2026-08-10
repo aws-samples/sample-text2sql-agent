@@ -5,7 +5,7 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as apigw from 'aws-cdk-lib/aws-apigateway';
 import * as s3 from 'aws-cdk-lib/aws-s3';
-import { RedshiftServerless } from './redshift-serverless';
+import { IRedshiftConnection } from './redshift-connection';
 import { AgentCoreRuntime } from './agentcore-runtime';
 import { Cognito } from './cognito';
 import { PublicRestApi } from './public-rest-api';
@@ -19,14 +19,15 @@ export interface AgentBackendProps {
   configTable: dynamodb.ITable;
   filesTable: dynamodb.ITable;
   bedrockModelId: string;
-  redshift: RedshiftServerless;
+  redshift: IRedshiftConnection;
   regionalWaf: RegionalWaf;
   webAclArn: string;
   sqlResultThreshold: number;
   enablePromptCache: boolean;
-  downloadBucket: s3.IBucket;
+  /** CSV ダウンロード用バケット。未指定時は CSV ダウンロード機能が無効 (existingRedshift モード) */
+  downloadBucket?: s3.IBucket;
   /** UNLOAD ... IAM_ROLE に渡す ARN ("default" の場合は文字列 "default") */
-  redshiftUnloadIamRoleArn: string;
+  redshiftUnloadIamRoleArn?: string;
   /** presigned URL の有効期限秒 */
   downloadPresignTtlSeconds: number;
   /** UserPool に作るテストユーザー名 (空の場合は作らない) */
@@ -81,8 +82,10 @@ export class AgentBackend extends Construct {
         CONFIG_TABLE_NAME: props.configTable.tableName,
         FILES_TABLE_NAME: props.filesTable.tableName,
         AGENTCORE_RUNTIME_ARN: this.agentCoreRuntime.runtime.agentRuntimeArn,
-        DOWNLOAD_BUCKET_NAME: props.downloadBucket.bucketName,
         DOWNLOAD_PRESIGN_TTL_SECONDS: String(props.downloadPresignTtlSeconds),
+        ...(props.downloadBucket ? {
+          DOWNLOAD_BUCKET_NAME: props.downloadBucket.bucketName,
+        } : {}),
       },
     });
 
@@ -96,7 +99,9 @@ export class AgentBackend extends Construct {
     props.filesTable.grantReadData(this.handler);
 
     // S3 (presigned URL 発行) 権限
-    props.downloadBucket.grantRead(this.handler);
+    if (props.downloadBucket) {
+      props.downloadBucket.grantRead(this.handler);
+    }
 
     // AgentCore Runtime invoke 権限
     this.agentCoreRuntime.runtime.grantInvokeRuntime(this.handler);

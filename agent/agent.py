@@ -34,10 +34,18 @@ BEDROCK_MODEL_ID = os.environ["BEDROCK_MODEL_ID"]
 REDSHIFT_WORKGROUP_NAME = os.environ["REDSHIFT_WORKGROUP_NAME"]
 REDSHIFT_DATABASE = os.environ["REDSHIFT_DATABASE"]
 REDSHIFT_SECRET_ARN = os.environ["REDSHIFT_SECRET_ARN"]
-DOWNLOAD_BUCKET_NAME = os.environ["DOWNLOAD_BUCKET_NAME"]
-DOWNLOAD_PRESIGN_TTL_SECONDS = int(os.environ["DOWNLOAD_PRESIGN_TTL_SECONDS"])
-REDSHIFT_UNLOAD_IAM_ROLE_ARN = os.environ["REDSHIFT_UNLOAD_IAM_ROLE_ARN"]
+# CSV ダウンロード機能 (UNLOAD)。existingRedshift モードでは無効化される
+ENABLE_CSV_DOWNLOAD = os.environ.get("ENABLE_CSV_DOWNLOAD", "true").lower() == "true"
+DOWNLOAD_BUCKET_NAME = os.environ.get("DOWNLOAD_BUCKET_NAME", "")
+DOWNLOAD_PRESIGN_TTL_SECONDS = int(os.environ.get("DOWNLOAD_PRESIGN_TTL_SECONDS", "3600"))
+REDSHIFT_UNLOAD_IAM_ROLE_ARN = os.environ.get("REDSHIFT_UNLOAD_IAM_ROLE_ARN", "")
 ENABLE_PROMPT_CACHE = os.environ.get("ENABLE_PROMPT_CACHE", "false").lower() == "true"
+
+if ENABLE_CSV_DOWNLOAD and not (DOWNLOAD_BUCKET_NAME and REDSHIFT_UNLOAD_IAM_ROLE_ARN):
+    # No Silent Fallback: 有効なのに必須設定が無い状態は起動時に落とす
+    raise RuntimeError(
+        "ENABLE_CSV_DOWNLOAD=true requires DOWNLOAD_BUCKET_NAME and REDSHIFT_UNLOAD_IAM_ROLE_ARN"
+    )
 
 dynamodb = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION"))
 sessions_table = dynamodb.Table(SESSIONS_TABLE_NAME)
@@ -96,11 +104,17 @@ def build_system_prompt(config: dict) -> str:
     if schema_str:
         base += f"\n\n## データベーススキーマ\n{schema_str}"
     base += "\n\n分析結果を可視化すべき場合は _render_chart ツールを活用してください。"
-    base += (
-        "\n\n結果が 200 行を超える、または超える可能性が高いと判断した場合は、"
-        "ユーザーに確認したうえで _create_csv_file ツールで CSV ダウンロードリンクを提供してください。"
-        "ユーザーから明示的に CSV ダウンロードを要求された場合も同ツールを使用してください。"
-    )
+    if ENABLE_CSV_DOWNLOAD:
+        base += (
+            "\n\n結果が 200 行を超える、または超える可能性が高いと判断した場合は、"
+            "ユーザーに確認したうえで _create_csv_file ツールで CSV ダウンロードリンクを提供してください。"
+            "ユーザーから明示的に CSV ダウンロードを要求された場合も同ツールを使用してください。"
+        )
+    else:
+        base += (
+            "\n\n結果が 200 行を超える、または超える可能性が高いと判断した場合は、"
+            "WHERE句やLIMIT句で結果を絞り込むか、GROUP BYで集計してください。"
+        )
     return base
 
 
@@ -139,6 +153,7 @@ def build_agent(
         files_table_name=FILES_TABLE_NAME,
         presign_ttl_seconds=DOWNLOAD_PRESIGN_TTL_SECONDS,
         redshift_unload_iam_role=REDSHIFT_UNLOAD_IAM_ROLE_ARN,
+        enable_csv_download=ENABLE_CSV_DOWNLOAD,
     )
 
     # skills の読み込み (Strands AgentSkills Plugin)
