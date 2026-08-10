@@ -193,12 +193,16 @@ aws secretsmanager create-secret \
 DB ユーザーが以下のいずれかに該当する場合、デプロイは失敗しロールバックします:
 
 - superuser である
-- いずれかのユーザースキーマに CREATE 権限を持つ
 - いずれかのユーザーテーブルに INSERT / UPDATE / DELETE 権限を持つ
 
 これは既存データを保護するためのガードレールです。失敗した場合は
 CloudFormation イベントのエラーメッセージで違反内容を確認し、DB ユーザーの
 権限を修正して再デプロイしてください。
+
+> **補足**: Redshift はデフォルトで `public` スキーマの CREATE 権限を全ユーザーに
+> 許可しています。CREATE では既存データを変更できないためデプロイはブロックしませんが、
+> 検証 Lambda のログに警告が出ます。塞ぐ場合は管理者で
+> `REVOKE CREATE ON SCHEMA public FROM PUBLIC;` を実行してください。
 
 ### 5. スキーマ生成と Agent 作成
 

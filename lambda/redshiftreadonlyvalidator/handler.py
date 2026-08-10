@@ -30,27 +30,37 @@ redshift_data = boto3.client("redshift-data")
 # システムスキーマは検証対象から除外する
 _SYSTEM_SCHEMAS = "('pg_catalog', 'pg_internal', 'information_schema', 'catalog_history', 'pg_automv', 'pg_auto_copy', 'pg_mv', 'pg_s3', 'pg_temp_1', 'pg_toast')"
 
-# 検証クエリ。行が返ったら違反 (readonly ではない)。
-_VALIDATION_QUERIES: list[tuple[str, str]] = [
+# ブロッキング検証クエリ。行が返ったら違反 (既存データを変更できてしまう)。
+_BLOCKING_QUERIES: list[tuple[str, str]] = [
     (
         "superuser check",
         "SELECT usename FROM pg_user WHERE usename = current_user AND usesuper = true",
     ),
+    # 注: Redshift の has_table_privilege は PostgreSQL と異なり
+    # 'insert,update,delete' のようなカンマ区切り指定を受け付けないため、
+    # 権限ごとに OR で列挙する
     # standard_conforming_strings が ON のため SQL 側は 'pg\_%' (LIKE の _ をエスケープ)
+    (
+        "table write privilege check",
+        "SELECT schemaname || '.' || tablename FROM pg_tables "
+        f"WHERE schemaname NOT LIKE 'pg\\_%' AND schemaname NOT IN {_SYSTEM_SCHEMAS} "
+        "AND (has_table_privilege(current_user, quote_ident(schemaname) || '.' || quote_ident(tablename), 'insert') "
+        "OR has_table_privilege(current_user, quote_ident(schemaname) || '.' || quote_ident(tablename), 'update') "
+        "OR has_table_privilege(current_user, quote_ident(schemaname) || '.' || quote_ident(tablename), 'delete')) "
+        "LIMIT 20",
+    ),
+]
+
+# 警告のみの検証クエリ。
+# Redshift はデフォルトで public スキーマの CREATE を PUBLIC (全ユーザー) に許可しているため、
+# スキーマ CREATE 権限はブロックせず警告に留める (CREATE では既存データは変更できない)。
+# 塞ぎたい場合は `REVOKE CREATE ON SCHEMA public FROM PUBLIC;` を実行する。
+_WARNING_QUERIES: list[tuple[str, str]] = [
     (
         "schema CREATE privilege check",
         "SELECT nspname FROM pg_namespace "
         f"WHERE nspname NOT LIKE 'pg\\_%' AND nspname NOT IN {_SYSTEM_SCHEMAS} "
         "AND has_schema_privilege(current_user, nspname, 'create') "
-        "LIMIT 20",
-    ),
-    (
-        "table write privilege check",
-        "SELECT schemaname || '.' || tablename FROM pg_tables "
-        f"WHERE schemaname NOT LIKE 'pg\\_%' AND schemaname NOT IN {_SYSTEM_SCHEMAS} "
-        "AND has_table_privilege(current_user, "
-        "quote_ident(schemaname) || '.' || quote_ident(tablename), "
-        "'insert,update,delete') "
         "LIMIT 20",
     ),
 ]
@@ -94,12 +104,25 @@ def _first_column_values(records: list[list[dict]]) -> list[str]:
 def validate_readonly(workgroup_name: str, database: str, secret_arn: str) -> None:
     """readonly でなければ RuntimeError を投げる"""
     violations: list[str] = []
-    for name, sql in _VALIDATION_QUERIES:
+    for name, sql in _BLOCKING_QUERIES:
         records = _execute_sql(workgroup_name, database, secret_arn, sql)
         if records:
             values = _first_column_values(records)
             violations.append(f"{name}: {', '.join(values[:10])}")
             logger.error("readonly validation violation — %s: %s", name, values)
+        else:
+            logger.info("readonly validation passed: %s", name)
+
+    for name, sql in _WARNING_QUERIES:
+        records = _execute_sql(workgroup_name, database, secret_arn, sql)
+        if records:
+            values = _first_column_values(records)
+            logger.warning(
+                "readonly validation warning — %s: %s "
+                "(CREATE cannot modify existing data; run "
+                "`REVOKE CREATE ON SCHEMA <schema> FROM PUBLIC;` to remove it)",
+                name, values,
+            )
         else:
             logger.info("readonly validation passed: %s", name)
 
