@@ -14,17 +14,29 @@ existingRedshift モードのデプロイ時ガードレール。
   - TEMP/TEMPORARY : セッション限りの一時テーブル作成。既存データは変更できない。
     Redshift Spectrum クエリの実行要件でもあるため許可する
 
+実装原則: **公式ドキュメントに記載された API / ビュー / 関数のみを使う**。
+  ドキュメント未記載で偶然動く構文 (例: SHOW GRANTS FOR GROUP) には依存しない。
+  逆にドキュメントに記載があっても実機で未サポートのもの (SHOW GRANTS FOR PUBLIC は
+  "Permission discovery for PUBLIC is not supported" を返す) は使えないため、
+  PUBLIC 経由の権限は has_table_privilege による実効権限チェックでカバーする。
+
 権限の付与経路と対応するチェック:
-  1. ユーザーへの直接 GRANT   → SHOW GRANTS FOR <user>
+  1. ユーザーへの直接 GRANT   → SHOW GRANTS FOR <user> (文書化された構文)
   2. ロール経由 (入れ子含む)   → svv_user_grants + svv_role_grants で展開し SHOW GRANTS FOR ROLE
-  3. グループ経由             → SHOW GRANTS に FOR GROUP 構文がなく列挙できないため、
-                               グループ所属自体を「検証不能」として失敗させ、ロール利用を案内
-  4. PUBLIC への GRANT        → has_table_privilege (PUBLIC 継承を確認できる唯一の手段) を
-                               保険として実行。関数が受け付ける 6 権限のうち SELECT 以外の
-                               5 権限 (INSERT/UPDATE/DELETE/DROP/REFERENCES) を検査
+  3. グループ経由             → pg_group で所属グループを列挙し、
+                               SVV_RELATION_PRIVILEGES / SVV_SCHEMA_PRIVILEGES /
+                               SVV_DATABASE_PRIVILEGES (いずれも group への付与を表示すると
+                               文書に明記) で各グループの権限を検査
+  4. PUBLIC への GRANT        → has_table_privilege (実効権限を確認できる文書化された手段)。
+                               関数が受け付ける 6 権限のうち SELECT 以外の
+                               5 権限 (INSERT/UPDATE/DELETE/DROP/REFERENCES) を検査。
+                               この実効チェックはグループ経由の継承も含むため、経路 3 の
+                               二重の保険にもなっている
   5. 所有権                   → pg_class.relowner / pg_namespace.nspowner
                                (owner は GRANT なしで全操作できるため)
   6. superuser               → pg_user.usesuper
+  補助: ALTER DEFAULT PRIVILEGES による将来オブジェクトへの自動付与
+                             → SVV_DEFAULT_PRIVILEGES で検査
 
 警告のみ (ブロックしない):
   - スキーマへの CREATE 権限。Redshift はデフォルトで public スキーマの CREATE を
@@ -210,19 +222,15 @@ def _check_role_grants(ctx: ValidationContext, roles: set[str]) -> list[str]:
     return violations
 
 
-def _check_group_membership(ctx: ValidationContext, username: str) -> list[str]:
-    """経路 3: グループ所属の検出。
-
-    グループに付与された権限は SHOW GRANTS で列挙できない (FOR GROUP 構文が無い) ため、
-    所属していたら「検証不能」として違反にする。ロールへの移行を案内する。
-    """
+def _user_groups(ctx: ValidationContext) -> list[str]:
+    """ユーザーが所属するグループ名を列挙する"""
     _, user_rows = ctx.execute("SELECT usesysid FROM pg_user WHERE usename = current_user")
     if not user_rows:
         raise RuntimeError("could not resolve current user id")
     usesysid = str(user_rows[0][0])
 
     _, group_rows = ctx.execute("SELECT groname, grolist FROM pg_group")
-    violations = []
+    groups = []
     for row in group_rows:
         groname, grolist = row[0], row[1]
         if grolist is None:
@@ -230,11 +238,73 @@ def _check_group_membership(ctx: ValidationContext, username: str) -> list[str]:
         # grolist は "{100,101,...}" 形式の文字列で返る
         members = set(re.findall(r"\d+", str(grolist)))
         if usesysid in members:
+            groups.append(str(groname))
+    return groups
+
+
+def _check_group_grants(ctx: ValidationContext, username: str) -> list[str]:
+    """経路 3: グループ経由の GRANT の検査。
+
+    SHOW GRANTS はグループを対象にできない (FOR GROUP は文書化されていない) ため、
+    「group への付与を表示する」と文書に明記されている SVV_*_PRIVILEGES 系ビューで列挙する。
+    テーブル (relation) / スキーマ / データベースの 3 スコープを検査すれば、
+    データを変更しうる権限はカバーできる。
+
+    ビューの可視性は「自分がアクセスできる identity の行のみ」だが、所属グループは
+    メンバー本人から見えることを実機確認済み。
+    """
+    groups = _user_groups(ctx)
+    if not groups:
+        return []
+
+    group_list = ", ".join(f"'{g.replace(chr(39), chr(39) * 2)}'" for g in groups)
+    violations = []
+
+    queries = [
+        # (ビュー, オブジェクト名列, 追加の許可権限)
+        ("svv_relation_privileges", "relation_name", set()),
+        # スキーマの CREATE はユーザー直接付与と同様に警告相当だが、グループ経由で
+        # 明示的に CREATE を付与している構成はデフォルトではないため違反側に倒す
+        ("svv_schema_privileges", "namespace_name", set()),
+        ("svv_database_privileges", "database_name", set()),
+    ]
+    for view, obj_col, extra_allowed in queries:
+        allowed = _ALLOWED_PRIVILEGES | extra_allowed
+        _, rows = ctx.execute(
+            f"SELECT {obj_col}, privilege_type, identity_name FROM {view} "
+            f"WHERE identity_type = 'group' AND identity_name IN ({group_list}) "
+            "LIMIT 100"
+        )
+        for row in rows:
+            obj, priv, grp = str(row[0]), str(row[1] or "").upper(), str(row[2])
+            if priv in allowed:
+                continue
             violations.append(
-                f"user '{username}' belongs to group '{groname}' — group grants cannot be "
-                "enumerated via SHOW GRANTS, so validation is impossible. "
-                "Please use roles instead of groups for this user."
+                f"group '{grp}' (member: '{username}') has {priv} on {obj} [{view}]"
             )
+    return violations
+
+
+def _check_default_privileges(ctx: ValidationContext, username: str) -> list[str]:
+    """補助: ALTER DEFAULT PRIVILEGES による将来オブジェクトへの自動付与の検査。
+
+    SVV_DEFAULT_PRIVILEGES は「自分に付与された default privilege」を表示する
+    (文書化済み)。SELECT 以外の自動付与があれば違反とする。
+    """
+    _, rows = ctx.execute(
+        "SELECT schema_name, object_type, privilege_type, grantee_name, grantee_type "
+        "FROM svv_default_privileges LIMIT 100"
+    )
+    violations = []
+    for row in rows:
+        schema, obj_type, priv = str(row[0]), str(row[1]), str(row[2] or "").upper()
+        grantee, gtype = str(row[3]), str(row[4])
+        if priv in _ALLOWED_PRIVILEGES:
+            continue
+        violations.append(
+            f"default privilege {priv} on future {obj_type} in schema {schema} "
+            f"is granted to {gtype} '{grantee}'"
+        )
     return violations
 
 
@@ -325,7 +395,8 @@ def validate_readonly(workgroup_name: str, database: str, secret_arn: str) -> No
     roles, role_violations = _expand_roles(ctx, username)
     violations += role_violations
     violations += _check_role_grants(ctx, roles)
-    violations += _check_group_membership(ctx, username)
+    violations += _check_group_grants(ctx, username)
+    violations += _check_default_privileges(ctx, username)
     violations += _check_ownership(ctx, username)
     violations += _check_public_inherited(ctx, username)
 

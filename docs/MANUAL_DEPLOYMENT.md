@@ -209,9 +209,12 @@ aws secretsmanager create-secret \
 > 許可しています。Redshift Spectrum クエリの実行には TEMP 権限が必要なので、
 > Spectrum を利用する環境のユーザーもそのまま検証を通過できます。
 
-> **グループについて**: グループに付与された権限は `SHOW GRANTS` で列挙できないため、
-> 対象ユーザーがグループに所属している場合は「検証不能」としてデプロイを失敗させます。
-> このユーザーにはグループではなく**ロール**を使用してください。
+> **グループについて**: グループ経由の権限は `SVV_RELATION_PRIVILEGES` /
+> `SVV_SCHEMA_PRIVILEGES` / `SVV_DATABASE_PRIVILEGES`（いずれもグループへの付与を
+> 表示すると公式ドキュメントに明記）で列挙して検査します。SELECT / USAGE のみを
+> 持つグループへの所属はデプロイを妨げません。
+> また `ALTER DEFAULT PRIVILEGES` による将来オブジェクトへの自動付与も
+> `SVV_DEFAULT_PRIVILEGES` で検査します。
 
 失敗した場合は CloudFormation イベントのエラーメッセージ（違反した権限の一覧が含まれます）
 を確認し、DB ユーザーの権限を修正して再デプロイしてください。
