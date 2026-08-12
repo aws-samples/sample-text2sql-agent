@@ -1,19 +1,43 @@
 """CloudFormation カスタムリソース: 既存 Redshift の DB ユーザーが読み取り専用であることを検証する
 
 existingRedshift モードのデプロイ時ガードレール。
-提供された Secret の DB ユーザーで Data API に接続し、以下を検証する:
+提供された Secret の DB ユーザーで Data API に接続し、許可リスト方式で検証する。
 
-  1. superuser でないこと (pg_user.usesuper = false)
-  2. どのユーザースキーマにも CREATE 権限を持たないこと (has_schema_privilege)
-  3. どのユーザーテーブルにも INSERT / UPDATE / DELETE 権限を持たないこと (has_table_privilege)
+設計方針 (デフォルト拒否):
+  「危険な権限を列挙して弾く」のではなく「安全と分かっている権限だけを許可し、
+  それ以外はすべて違反」とする。Redshift に新しい権限タイプが追加されても
+  自動的に違反側に落ちるため、コードの追従が不要になる。
+
+許可される権限 (_ALLOWED_PRIVILEGES):
+  - SELECT    : データ読み取り (本機能の目的そのもの)
+  - USAGE     : スキーマ内オブジェクトへの参照経路 (これ自体はデータに触れない)
+  - TEMP/TEMPORARY : セッション限りの一時テーブル作成。既存データは変更できない。
+    Redshift Spectrum クエリの実行要件でもあるため許可する
+
+権限の付与経路と対応するチェック:
+  1. ユーザーへの直接 GRANT   → SHOW GRANTS FOR <user>
+  2. ロール経由 (入れ子含む)   → svv_user_grants + svv_role_grants で展開し SHOW GRANTS FOR ROLE
+  3. グループ経由             → SHOW GRANTS に FOR GROUP 構文がなく列挙できないため、
+                               グループ所属自体を「検証不能」として失敗させ、ロール利用を案内
+  4. PUBLIC への GRANT        → has_table_privilege (PUBLIC 継承を確認できる唯一の手段) を
+                               保険として実行。関数が受け付ける 6 権限のうち SELECT 以外の
+                               5 権限 (INSERT/UPDATE/DELETE/DROP/REFERENCES) を検査
+  5. 所有権                   → pg_class.relowner / pg_namespace.nspowner
+                               (owner は GRANT なしで全操作できるため)
+  6. superuser               → pg_user.usesuper
+
+警告のみ (ブロックしない):
+  - スキーマへの CREATE 権限。Redshift はデフォルトで public スキーマの CREATE を
+    PUBLIC (全ユーザー) に許可しており、CREATE では既存データを変更できないため。
+    塞ぐ場合は `REVOKE CREATE ON SCHEMA public FROM PUBLIC;` を実行する
 
 1 つでも違反があれば例外を投げ、CloudFormation のデプロイ自体を失敗させる。
-
 Delete 時は何もしない (このリソースは何も作成しないため)。
 """
 
 import logging
 import os
+import re
 import time
 
 import boto3
@@ -27,111 +51,296 @@ logger = logging.getLogger(__name__)
 
 redshift_data = boto3.client("redshift-data")
 
-# システムスキーマは検証対象から除外する
+# 許可する権限タイプ (これ以外が付与されていたら違反)
+_ALLOWED_PRIVILEGES = {"SELECT", "USAGE", "TEMP", "TEMPORARY"}
+
+# システムスキーマは所有権チェック等の対象から除外する
 _SYSTEM_SCHEMAS = "('pg_catalog', 'pg_internal', 'information_schema', 'catalog_history', 'pg_automv', 'pg_auto_copy', 'pg_mv', 'pg_s3', 'pg_temp_1', 'pg_toast')"
 
-# ブロッキング検証クエリ。行が返ったら違反 (既存データを変更できてしまう)。
-_BLOCKING_QUERIES: list[tuple[str, str]] = [
-    (
-        "superuser check",
-        "SELECT usename FROM pg_user WHERE usename = current_user AND usesuper = true",
-    ),
-    # 注: Redshift の has_table_privilege は PostgreSQL と異なり
-    # 'insert,update,delete' のようなカンマ区切り指定を受け付けないため、
-    # 権限ごとに OR で列挙する
-    # standard_conforming_strings が ON のため SQL 側は 'pg\_%' (LIKE の _ をエスケープ)
-    (
-        "table write privilege check",
+
+class ValidationContext:
+    """Data API 実行のまとめ役"""
+
+    def __init__(self, workgroup_name: str, database: str, secret_arn: str):
+        self.workgroup_name = workgroup_name
+        self.database = database
+        self.secret_arn = secret_arn
+
+    def execute(self, sql: str) -> tuple[list[str], list[list]]:
+        """SQL を実行し (カラム名, 行) を返す (同期待ち)"""
+        resp = redshift_data.execute_statement(
+            WorkgroupName=self.workgroup_name,
+            Database=self.database,
+            SecretArn=self.secret_arn,
+            Sql=sql,
+        )
+        statement_id = resp["Id"]
+        for _ in range(120):
+            desc = redshift_data.describe_statement(Id=statement_id)
+            status = desc["Status"]
+            if status == "FINISHED":
+                break
+            if status in ("FAILED", "ABORTED"):
+                error = desc.get("Error", "Unknown error")
+                raise RuntimeError(f"Validation query failed ({status}): {error} — SQL: {sql[:120]}")
+            time.sleep(1)
+        else:
+            raise RuntimeError(f"Validation query timed out — SQL: {sql[:120]}")
+
+        if not desc.get("HasResultSet"):
+            return [], []
+        columns: list[str] = []
+        rows: list[list] = []
+        next_token = None
+        while True:
+            kwargs = {"Id": statement_id}
+            if next_token:
+                kwargs["NextToken"] = next_token
+            result = redshift_data.get_statement_result(**kwargs)
+            if not columns:
+                columns = [c["name"].lower() for c in result["ColumnMetadata"]]
+            for record in result.get("Records", []):
+                rows.append([_field_value(f) for f in record])
+            next_token = result.get("NextToken")
+            if not next_token:
+                break
+        return columns, rows
+
+
+def _field_value(field: dict):
+    if field.get("isNull"):
+        return None
+    for key in ("stringValue", "longValue", "doubleValue", "booleanValue"):
+        if key in field:
+            return field[key]
+    return None
+
+
+def _quote_ident(ident: str) -> str:
+    return '"' + ident.replace('"', '""') + '"'
+
+
+def _current_user(ctx: ValidationContext) -> str:
+    _, rows = ctx.execute("SELECT current_user")
+    return str(rows[0][0])
+
+
+# ---------------------------------------------------------------------------
+# 各チェック (違反メッセージのリストを返す)
+# ---------------------------------------------------------------------------
+
+def _check_superuser(ctx: ValidationContext) -> list[str]:
+    _, rows = ctx.execute(
+        "SELECT usename FROM pg_user WHERE usename = current_user AND usesuper = true"
+    )
+    return [f"user '{rows[0][0]}' is a superuser"] if rows else []
+
+
+def _disallowed_from_show_grants(columns: list[str], rows: list[list], subject: str) -> list[str]:
+    """SHOW GRANTS の結果から許可リスト外の権限を抽出する"""
+    violations = []
+    try:
+        priv_idx = columns.index("privilege_type")
+    except ValueError:
+        raise RuntimeError(f"SHOW GRANTS result has no privilege_type column: {columns}")
+    obj_idx = columns.index("object_name") if "object_name" in columns else None
+    scope_idx = columns.index("privilege_scope") if "privilege_scope" in columns else None
+    for row in rows:
+        priv = str(row[priv_idx] or "").upper()
+        if priv in _ALLOWED_PRIVILEGES:
+            continue
+        obj = str(row[obj_idx]) if obj_idx is not None and row[obj_idx] is not None else "?"
+        scope = str(row[scope_idx]) if scope_idx is not None and row[scope_idx] is not None else ""
+        violations.append(f"{subject} has {priv} on {obj}{f' (scope: {scope})' if scope else ''}")
+    return violations
+
+
+def _check_direct_grants(ctx: ValidationContext, username: str) -> list[str]:
+    """経路 1: ユーザーへの直接 GRANT (scoped permission 含む) を SHOW GRANTS で検査"""
+    columns, rows = ctx.execute(f"SHOW GRANTS FOR {_quote_ident(username)}")
+    return _disallowed_from_show_grants(columns, rows, f"user '{username}'")
+
+
+def _expand_roles(ctx: ValidationContext, username: str) -> tuple[set[str], list[str]]:
+    """経路 2: ユーザーが持つロールを入れ子含めて展開する。
+
+    Returns: (通常ロールの集合, sys: ロール由来の違反リスト)
+    """
+    violations: list[str] = []
+    _, rows = ctx.execute(
+        "SELECT role_name FROM svv_user_grants WHERE user_name = current_user"
+    )
+    roles = {str(r[0]) for r in rows if r[0]}
+
+    # 入れ子ロールの展開 (role に granted された role)
+    _, nested_rows = ctx.execute(
+        "SELECT role_name, granted_role_name FROM svv_role_grants"
+    )
+    edges: dict[str, set[str]] = {}
+    for r in nested_rows:
+        if r[0] and r[1]:
+            edges.setdefault(str(r[0]), set()).add(str(r[1]))
+    frontier = set(roles)
+    while frontier:
+        nxt = set()
+        for role in frontier:
+            for granted in edges.get(role, set()):
+                if granted not in roles:
+                    roles.add(granted)
+                    nxt.add(granted)
+        frontier = nxt
+
+    # システムロール (sys:*) はシステム権限のバンドルで SHOW GRANTS では中身を列挙できない。
+    # デフォルト拒否の方針に従い、付与されていたら違反とする
+    normal_roles = set()
+    for role in roles:
+        if role.lower().startswith("sys:"):
+            violations.append(f"user '{username}' has system role '{role}'")
+        else:
+            normal_roles.add(role)
+    return normal_roles, violations
+
+
+def _check_role_grants(ctx: ValidationContext, roles: set[str]) -> list[str]:
+    """経路 2: 各ロールの GRANT を SHOW GRANTS FOR ROLE で検査"""
+    violations = []
+    for role in sorted(roles):
+        columns, rows = ctx.execute(f"SHOW GRANTS FOR ROLE {_quote_ident(role)}")
+        violations.extend(_disallowed_from_show_grants(columns, rows, f"role '{role}'"))
+    return violations
+
+
+def _check_group_membership(ctx: ValidationContext, username: str) -> list[str]:
+    """経路 3: グループ所属の検出。
+
+    グループに付与された権限は SHOW GRANTS で列挙できない (FOR GROUP 構文が無い) ため、
+    所属していたら「検証不能」として違反にする。ロールへの移行を案内する。
+    """
+    _, user_rows = ctx.execute("SELECT usesysid FROM pg_user WHERE usename = current_user")
+    if not user_rows:
+        raise RuntimeError("could not resolve current user id")
+    usesysid = str(user_rows[0][0])
+
+    _, group_rows = ctx.execute("SELECT groname, grolist FROM pg_group")
+    violations = []
+    for row in group_rows:
+        groname, grolist = row[0], row[1]
+        if grolist is None:
+            continue
+        # grolist は "{100,101,...}" 形式の文字列で返る
+        members = set(re.findall(r"\d+", str(grolist)))
+        if usesysid in members:
+            violations.append(
+                f"user '{username}' belongs to group '{groname}' — group grants cannot be "
+                "enumerated via SHOW GRANTS, so validation is impossible. "
+                "Please use roles instead of groups for this user."
+            )
+    return violations
+
+
+def _check_ownership(ctx: ValidationContext, username: str) -> list[str]:
+    """経路 5: 所有権 (owner は GRANT なしで DROP 含む全操作が可能)"""
+    violations = []
+    _, table_rows = ctx.execute(
+        "SELECT n.nspname || '.' || c.relname "
+        "FROM pg_class c "
+        "JOIN pg_namespace n ON c.relnamespace = n.oid "
+        "JOIN pg_user u ON c.relowner = u.usesysid "
+        "WHERE u.usename = current_user "
+        f"AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname NOT IN {_SYSTEM_SCHEMAS} "
+        "LIMIT 20"
+    )
+    if table_rows:
+        objs = ", ".join(str(r[0]) for r in table_rows[:10])
+        violations.append(f"user '{username}' owns relations: {objs}")
+
+    _, schema_rows = ctx.execute(
+        "SELECT n.nspname FROM pg_namespace n "
+        "JOIN pg_user u ON n.nspowner = u.usesysid "
+        "WHERE u.usename = current_user "
+        f"AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname NOT IN {_SYSTEM_SCHEMAS} "
+        "LIMIT 20"
+    )
+    if schema_rows:
+        objs = ", ".join(str(r[0]) for r in schema_rows[:10])
+        violations.append(f"user '{username}' owns schemas: {objs}")
+    return violations
+
+
+def _check_public_inherited(ctx: ValidationContext, username: str) -> list[str]:
+    """経路 4: PUBLIC 経由の継承を含む実効権限の保険チェック。
+
+    has_table_privilege は PUBLIC への GRANT を含む実効権限を確認できる唯一の手段。
+    関数が受け付けるのは SELECT/INSERT/UPDATE/DELETE/DROP/REFERENCES の 6 種で、
+    TRUNCATE/ALTER は表現できない (それらは SHOW GRANTS 側で捕捉される)。
+    """
+    privs = ["insert", "update", "delete", "drop", "references"]
+    cond = " OR ".join(
+        f"has_table_privilege(current_user, quote_ident(schemaname) || '.' || quote_ident(tablename), '{p}')"
+        for p in privs
+    )
+    _, rows = ctx.execute(
         "SELECT schemaname || '.' || tablename FROM pg_tables "
         f"WHERE schemaname NOT LIKE 'pg\\_%' AND schemaname NOT IN {_SYSTEM_SCHEMAS} "
-        "AND (has_table_privilege(current_user, quote_ident(schemaname) || '.' || quote_ident(tablename), 'insert') "
-        "OR has_table_privilege(current_user, quote_ident(schemaname) || '.' || quote_ident(tablename), 'update') "
-        "OR has_table_privilege(current_user, quote_ident(schemaname) || '.' || quote_ident(tablename), 'delete')) "
-        "LIMIT 20",
-    ),
-]
+        f"AND ({cond}) "
+        "LIMIT 20"
+    )
+    if rows:
+        objs = ", ".join(str(r[0]) for r in rows[:10])
+        return [f"user '{username}' has effective write/drop privilege on: {objs}"]
+    return []
 
-# 警告のみの検証クエリ。
-# Redshift はデフォルトで public スキーマの CREATE を PUBLIC (全ユーザー) に許可しているため、
-# スキーマ CREATE 権限はブロックせず警告に留める (CREATE では既存データは変更できない)。
-# 塞ぎたい場合は `REVOKE CREATE ON SCHEMA public FROM PUBLIC;` を実行する。
-_WARNING_QUERIES: list[tuple[str, str]] = [
-    (
-        "schema CREATE privilege check",
+
+def _warn_schema_create(ctx: ValidationContext) -> None:
+    """警告のみ: スキーマ CREATE 権限 (Redshift デフォルトで public に付与されている)"""
+    _, rows = ctx.execute(
         "SELECT nspname FROM pg_namespace "
         f"WHERE nspname NOT LIKE 'pg\\_%' AND nspname NOT IN {_SYSTEM_SCHEMAS} "
         "AND has_schema_privilege(current_user, nspname, 'create') "
-        "LIMIT 20",
-    ),
-]
-
-
-def _execute_sql(workgroup_name: str, database: str, secret_arn: str, sql: str) -> list[list[dict]]:
-    """Data API で SQL を実行し、結果レコードを返す (同期待ち)"""
-    resp = redshift_data.execute_statement(
-        WorkgroupName=workgroup_name,
-        Database=database,
-        SecretArn=secret_arn,
-        Sql=sql,
+        "LIMIT 20"
     )
-    statement_id = resp["Id"]
-    for _ in range(120):
-        desc = redshift_data.describe_statement(Id=statement_id)
-        status = desc["Status"]
-        if status == "FINISHED":
-            break
-        if status in ("FAILED", "ABORTED"):
-            error = desc.get("Error", "Unknown error")
-            raise RuntimeError(f"Validation query failed ({status}): {error}")
-        time.sleep(1)
-    else:
-        raise RuntimeError("Validation query timed out")
-
-    if not desc.get("HasResultSet"):
-        return []
-    result = redshift_data.get_statement_result(Id=statement_id)
-    return result.get("Records", [])
+    if rows:
+        schemas = [str(r[0]) for r in rows]
+        logger.warning(
+            "readonly validation warning — schema CREATE privilege: %s "
+            "(CREATE cannot modify existing data; run "
+            "`REVOKE CREATE ON SCHEMA <schema> FROM PUBLIC;` to remove it)",
+            schemas,
+        )
 
 
-def _first_column_values(records: list[list[dict]]) -> list[str]:
-    values = []
-    for row in records:
-        field = row[0] if row else {}
-        values.append(str(field.get("stringValue", field)))
-    return values
-
+# ---------------------------------------------------------------------------
+# エントリポイント
+# ---------------------------------------------------------------------------
 
 def validate_readonly(workgroup_name: str, database: str, secret_arn: str) -> None:
     """readonly でなければ RuntimeError を投げる"""
-    violations: list[str] = []
-    for name, sql in _BLOCKING_QUERIES:
-        records = _execute_sql(workgroup_name, database, secret_arn, sql)
-        if records:
-            values = _first_column_values(records)
-            violations.append(f"{name}: {', '.join(values[:10])}")
-            logger.error("readonly validation violation — %s: %s", name, values)
-        else:
-            logger.info("readonly validation passed: %s", name)
+    ctx = ValidationContext(workgroup_name, database, secret_arn)
+    username = _current_user(ctx)
+    logger.info("validating user %r (allow-list: %s)", username, sorted(_ALLOWED_PRIVILEGES))
 
-    for name, sql in _WARNING_QUERIES:
-        records = _execute_sql(workgroup_name, database, secret_arn, sql)
-        if records:
-            values = _first_column_values(records)
-            logger.warning(
-                "readonly validation warning — %s: %s "
-                "(CREATE cannot modify existing data; run "
-                "`REVOKE CREATE ON SCHEMA <schema> FROM PUBLIC;` to remove it)",
-                name, values,
-            )
-        else:
-            logger.info("readonly validation passed: %s", name)
+    violations: list[str] = []
+    violations += _check_superuser(ctx)
+    violations += _check_direct_grants(ctx, username)
+    roles, role_violations = _expand_roles(ctx, username)
+    violations += role_violations
+    violations += _check_role_grants(ctx, roles)
+    violations += _check_group_membership(ctx, username)
+    violations += _check_ownership(ctx, username)
+    violations += _check_public_inherited(ctx, username)
+
+    _warn_schema_create(ctx)
 
     if violations:
+        for v in violations:
+            logger.error("readonly validation violation — %s", v)
         raise RuntimeError(
             "The provided Redshift DB user is NOT read-only. "
             "Deployment is blocked to protect the existing Redshift data. "
-            "Violations: " + " / ".join(violations)
+            f"Allowed privileges are {sorted(_ALLOWED_PRIVILEGES)} only. "
+            "Violations: " + " / ".join(violations[:20])
         )
+    logger.info("readonly validation succeeded for user %r (roles checked: %s)", username, sorted(roles) or "none")
 
 
 def on_event(event, context):
