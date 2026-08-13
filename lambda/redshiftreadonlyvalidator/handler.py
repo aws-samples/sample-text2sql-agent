@@ -66,6 +66,11 @@ redshift_data = boto3.client("redshift-data")
 # 許可する権限タイプ (これ以外が付与されていたら違反)
 _ALLOWED_PRIVILEGES = {"SELECT", "USAGE", "TEMP", "TEMPORARY"}
 
+
+def _allowed_privileges_sql() -> str:
+    """SQL の NOT IN 句に埋め込む許可リスト。固定値のみでユーザー入力は含まない"""
+    return "(" + ", ".join(f"'{p}'" for p in sorted(_ALLOWED_PRIVILEGES)) + ")"
+
 # システムスキーマは所有権チェック等の対象から除外する
 _SYSTEM_SCHEMAS = "('pg_catalog', 'pg_internal', 'information_schema', 'catalog_history', 'pg_automv', 'pg_auto_copy', 'pg_mv', 'pg_s3', 'pg_temp_1', 'pg_toast')"
 
@@ -261,24 +266,24 @@ def _check_group_grants(ctx: ValidationContext, username: str) -> list[str]:
     violations = []
 
     queries = [
-        # (ビュー, オブジェクト名列, 追加の許可権限)
-        ("svv_relation_privileges", "relation_name", set()),
+        # (ビュー, オブジェクト名列)
+        ("svv_relation_privileges", "relation_name"),
         # スキーマの CREATE はユーザー直接付与と同様に警告相当だが、グループ経由で
         # 明示的に CREATE を付与している構成はデフォルトではないため違反側に倒す
-        ("svv_schema_privileges", "namespace_name", set()),
-        ("svv_database_privileges", "database_name", set()),
+        ("svv_schema_privileges", "namespace_name"),
+        ("svv_database_privileges", "database_name"),
     ]
-    for view, obj_col, extra_allowed in queries:
-        allowed = _ALLOWED_PRIVILEGES | extra_allowed
+    for view, obj_col in queries:
+        # 許可リスト外の行だけを SQL 側で絞り込む。返ってきた行 = 違反なので、
+        # LIMIT は「報告する違反の上限」にしかならず、権限行が何行あっても取りこぼさない
         _, rows = ctx.execute(
             f"SELECT {obj_col}, privilege_type, identity_name FROM {view} "
             f"WHERE identity_type = 'group' AND identity_name IN ({group_list}) "
+            f"AND UPPER(privilege_type) NOT IN {_allowed_privileges_sql()} "
             "LIMIT 100"
         )
         for row in rows:
             obj, priv, grp = str(row[0]), str(row[1] or "").upper(), str(row[2])
-            if priv in allowed:
-                continue
             violations.append(
                 f"group '{grp}' (member: '{username}') has {priv} on {obj} [{view}]"
             )
@@ -291,16 +296,17 @@ def _check_default_privileges(ctx: ValidationContext, username: str) -> list[str
     SVV_DEFAULT_PRIVILEGES は「自分に付与された default privilege」を表示する
     (文書化済み)。SELECT 以外の自動付与があれば違反とする。
     """
+    # 許可リスト外の行だけを SQL 側で絞り込む (返ってきた行 = 違反)
     _, rows = ctx.execute(
         "SELECT schema_name, object_type, privilege_type, grantee_name, grantee_type "
-        "FROM svv_default_privileges LIMIT 100"
+        "FROM svv_default_privileges "
+        f"WHERE UPPER(privilege_type) NOT IN {_allowed_privileges_sql()} "
+        "LIMIT 100"
     )
     violations = []
     for row in rows:
         schema, obj_type, priv = str(row[0]), str(row[1]), str(row[2] or "").upper()
         grantee, gtype = str(row[3]), str(row[4])
-        if priv in _ALLOWED_PRIVILEGES:
-            continue
         violations.append(
             f"default privilege {priv} on future {obj_type} in schema {schema} "
             f"is granted to {gtype} '{grantee}'"
