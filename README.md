@@ -14,6 +14,7 @@ CSV を S3 に置くだけで、自社データに対して自然言語で問い
 - ⚙️ **ノーコードカスタマイズ** — システムプロンプト・スキーマ・ナレッジを管理画面から編集
 - 🔐 **Cognito 認証** — Agent UI / Admin UI それぞれに独立した認証
 - 🛡️ **WAF 保護** — IP 制限による API Gateway の保護
+- 🏢 **既存 Redshift 対応** — すでにデータが入っている Redshift Serverless に読み取り専用で接続し、既存テーブルからスキーマを自動生成（[existingRedshift モード](docs/MANUAL_DEPLOYMENT.md#appendix-既存-redshift-serverless-を利用する-existingredshift-モード)）
 
 
 ## 🎥 デモ

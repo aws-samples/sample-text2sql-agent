@@ -7,22 +7,36 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as apigw from 'aws-cdk-lib/aws-apigateway';
 import { RedshiftServerless } from './redshift-serverless';
+import { IRedshiftConnection } from './redshift-connection';
 import { Cognito } from './cognito';
 import { PublicRestApi } from './public-rest-api';
 import { RegionalWaf } from './regional-waf';
 import { Frontend } from './frontend';
 import { RedshiftInitWorkflow } from './redshift-init-workflow';
 
+/**
+ * CSV アップロード機能 (Upload & Build) 一式の設定。
+ * existingRedshift モードでは未指定にし、機能ごと無効化する
+ * (既存 Redshift には COPY 用 IAM Role を関連付けられず、
+ * ワークフローの DROP TABLE が既存データを破壊しうるため)。
+ */
+export interface CsvUploadProps {
+  bucket: s3.IBucket;
+  /** 既存バケットを参照しているか (true のときフロントエンドでローカルアップロードを無効化) */
+  bucketIsExisting: boolean;
+  redshiftAdminRoleArn: string;
+  /** InitWorkflow が使う新規作成の Redshift (adminSecret が必要なため型を狭める) */
+  redshift: RedshiftServerless;
+}
+
 export interface AdminBackendProps {
   allowOrigin: string;
   allowedCidrs: string[];
   configTable: dynamodb.ITable;
   bedrockModelId: string;
-  redshift: RedshiftServerless;
-  csvBucket: s3.IBucket;
-  /** 既存バケットを参照しているか (true のときフロントエンドでローカルアップロードを無効化) */
-  csvBucketIsExisting: boolean;
-  redshiftAdminRoleArn: string;
+  redshift: IRedshiftConnection;
+  /** CSV アップロード機能。未指定時は Upload & Build を無効化 (existingRedshift モード) */
+  csvUpload?: CsvUploadProps;
   regionalWaf: RegionalWaf;
   webAclArn: string;
   /** UserPool に作るテストユーザー名 (空の場合は作らない) */
@@ -41,6 +55,8 @@ export class AdminBackend extends Construct {
 
   constructor(scope: Construct, id: string, props: AdminBackendProps) {
     super(scope, id);
+
+    const existingRedshiftMode = props.csvUpload === undefined;
 
     // Cognito
     this.cognito = new Cognito(this, 'Cognito', {
@@ -61,16 +77,20 @@ export class AdminBackend extends Construct {
         ALLOW_ORIGIN: props.allowOrigin,
         CONFIG_TABLE_NAME: props.configTable.tableName,
         BEDROCK_MODEL_ID: props.bedrockModelId,
-        CSV_BUCKET_NAME: props.csvBucket.bucketName,
+        ...(props.csvUpload ? {
+          CSV_BUCKET_NAME: props.csvUpload.bucket.bucketName,
+        } : {
+          // existingRedshift モード: スキーマ自動生成用に Data API 接続情報を渡す
+          EXISTING_REDSHIFT_MODE: 'true',
+          REDSHIFT_WORKGROUP_NAME: props.redshift.workgroupName,
+          REDSHIFT_DATABASE: props.redshift.dbName,
+          REDSHIFT_SECRET_ARN: props.redshift.agentSecret.secretArn,
+        }),
       },
     });
 
     // DynamoDB config テーブル読み書き
     props.configTable.grantReadWriteData(this.handler);
-
-    // S3 CSV バケット読み取り + PutObject (presigned URL 署名用)
-    props.csvBucket.grantRead(this.handler);
-    props.csvBucket.grantPut(this.handler);
 
     // Bedrock 呼び出し権限
     this.handler.addToRolePolicy(
@@ -80,20 +100,30 @@ export class AdminBackend extends Construct {
       }),
     );
 
-    // Redshift Init Workflow (Step Functions)
-    const initWorkflow = new RedshiftInitWorkflow(this, 'InitWorkflow', {
-      configTable: props.configTable,
-      redshift: props.redshift,
-      csvBucket: props.csvBucket,
-      redshiftAdminRoleArn: props.redshiftAdminRoleArn,
-    });
+    if (props.csvUpload) {
+      // S3 CSV バケット読み取り + PutObject (presigned URL 署名用)
+      props.csvUpload.bucket.grantRead(this.handler);
+      props.csvUpload.bucket.grantPut(this.handler);
 
-    // adminwebbackend Lambda に Step Functions 実行権限を付与
-    initWorkflow.stateMachine.grantStartExecution(this.handler);
-    initWorkflow.stateMachine.grantRead(this.handler);
+      // Redshift Init Workflow (Step Functions)
+      const initWorkflow = new RedshiftInitWorkflow(this, 'InitWorkflow', {
+        configTable: props.configTable,
+        redshift: props.csvUpload.redshift,
+        csvBucket: props.csvUpload.bucket,
+        redshiftAdminRoleArn: props.csvUpload.redshiftAdminRoleArn,
+      });
 
-    // ステートマシン ARN を環境変数で渡す
-    this.handler.addEnvironment('INIT_WORKFLOW_STATE_MACHINE_ARN', initWorkflow.stateMachine.stateMachineArn);
+      // adminwebbackend Lambda に Step Functions 実行権限を付与
+      initWorkflow.stateMachine.grantStartExecution(this.handler);
+      initWorkflow.stateMachine.grantRead(this.handler);
+
+      // ステートマシン ARN を環境変数で渡す
+      this.handler.addEnvironment('INIT_WORKFLOW_STATE_MACHINE_ARN', initWorkflow.stateMachine.stateMachineArn);
+    } else {
+      // existingRedshift モード: スキーマ自動生成 (information_schema 参照) 用に
+      // 読み取り専用ユーザーの Secret で Data API を実行できるようにする
+      props.redshift.grantDataApi(this.handler, props.redshift.agentSecret);
+    }
 
     // REST API
     this.api = new PublicRestApi(this, 'Api', {
@@ -120,6 +150,10 @@ export class AdminBackend extends Construct {
     this.api.addResource('POST', ['admin', 'apply-status'], this.handler, authorizer, stream);
     this.api.addResource('GET', ['admin', 'system-prompt'], this.handler, authorizer, stream);
     this.api.addResource('PUT', ['admin', 'system-prompt'], this.handler, authorizer, stream);
+    // existingRedshift モード用 (通常モードでは 400 を返す)
+    this.api.addResource('GET', ['admin', 'redshift', 'tables'], this.handler, authorizer, stream);
+    this.api.addResource('POST', ['admin', 'redshift', 'generate-schema'], this.handler, authorizer, stream);
+    this.api.addResource('POST', ['admin', 'redshift', 'apply'], this.handler, authorizer, stream);
 
     // Frontend
     this.frontend = new Frontend(this, 'Frontend', {
@@ -129,8 +163,11 @@ export class AdminBackend extends Construct {
         VITE_APP_API_ENDPOINT: this.api.url,
         VITE_APP_USER_POOL_ID: this.cognito.userPool.userPoolId,
         VITE_APP_USER_POOL_CLIENT_ID: this.cognito.userPoolClient.userPoolClientId,
-        VITE_APP_CSV_BUCKET_NAME: props.csvBucket.bucketName,
-        VITE_APP_CSV_BUCKET_IS_EXISTING: props.csvBucketIsExisting ? 'true' : 'false',
+        VITE_APP_EXISTING_REDSHIFT_MODE: existingRedshiftMode ? 'true' : 'false',
+        ...(props.csvUpload ? {
+          VITE_APP_CSV_BUCKET_NAME: props.csvUpload.bucket.bucketName,
+          VITE_APP_CSV_BUCKET_IS_EXISTING: props.csvUpload.bucketIsExisting ? 'true' : 'false',
+        } : {}),
       },
     });
   }

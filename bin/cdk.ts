@@ -16,6 +16,24 @@ const stackPrefix = app.node.tryGetContext('stackPrefix') ?? '';
 const testAgentUser = app.node.tryGetContext('testAgentUser') ?? '';
 const testAdminUser = app.node.tryGetContext('testAdminUser') ?? '';
 
+// 既存 Redshift Serverless 参照モード (workgroupName / database / secretArn の 3 点セット)
+const existingRedshiftContext = app.node.tryGetContext('existingRedshift') ?? {};
+const existingRedshiftKeys = ['workgroupName', 'database', 'secretArn'] as const;
+const providedKeys = existingRedshiftKeys.filter((k) => existingRedshiftContext[k]);
+if (providedKeys.length > 0 && providedKeys.length < existingRedshiftKeys.length) {
+  throw new Error(
+    `existingRedshift context には ${existingRedshiftKeys.join(', ')} をすべて指定してください。` +
+    `指定済み: ${providedKeys.join(', ')}`,
+  );
+}
+const existingRedshift = providedKeys.length === existingRedshiftKeys.length
+  ? {
+      workgroupName: existingRedshiftContext.workgroupName as string,
+      database: existingRedshiftContext.database as string,
+      secretArn: existingRedshiftContext.secretArn as string,
+    }
+  : undefined;
+
 // CloudFront 用 WAF は us-east-1 必須
 const wafStack = new WafStack(app, stackPrefix + 'DwhAgentWafStack', {
   env: {
@@ -42,5 +60,6 @@ new DwhAgentStack(app, stackPrefix + 'DwhAgentStack', {
   enablePromptCache,
   testAgentUser,
   testAdminUser,
+  existingRedshift,
   crossRegionReferences: true,
 });
